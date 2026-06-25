@@ -6,13 +6,39 @@ from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-WHATSAPP_MESSAGES_URL = (
-    f"https://graph.facebook.com/{settings.whatsapp_api_version}"
-    f"/{settings.whatsapp_phone_number_id}/messages"
-)
+def _messages_url() -> str:
+    phone_id = settings.whatsapp_phone_number_id.strip()
+    if not phone_id:
+        raise ValueError("WHATSAPP_PHONE_NUMBER_ID is not configured")
+    return (
+        f"https://graph.facebook.com/{settings.whatsapp_api_version}"
+        f"/{phone_id}/messages"
+    )
+
+
+async def mark_message_read(message_id: str) -> None:
+    if not message_id or not settings.whatsapp_phone_number_id.strip():
+        return
+    headers = {
+        "Authorization": f"Bearer {settings.whatsapp_access_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "status": "read",
+        "message_id": message_id,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(_messages_url(), headers=headers, json=payload)
+    except Exception:
+        logger.debug("mark_message_read failed for %s", message_id[:12])
 
 
 async def send_text_message(to: str, message: str) -> bool:
+    if not settings.whatsapp_phone_number_id.strip():
+        logger.error("Cannot send WhatsApp message: WHATSAPP_PHONE_NUMBER_ID is missing")
+        return False
     headers = {
         "Authorization": f"Bearer {settings.whatsapp_access_token}",
         "Content-Type": "application/json",
@@ -27,7 +53,7 @@ async def send_text_message(to: str, message: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
-                WHATSAPP_MESSAGES_URL,
+                _messages_url(),
                 headers=headers,
                 json=payload,
             )

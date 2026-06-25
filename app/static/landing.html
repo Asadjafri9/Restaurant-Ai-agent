@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Restaurant OS — Choose Portal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/app/styles.css" />
+  </head>
+  <body>
+    <div class="landing-wrap">
+      <div class="landing-head">
+        <div class="logo"><span class="dot"></span> Restaurant OS</div>
+        <h1>Choose your portal</h1>
+        <p>Each restaurant has its own isolated dashboard and database. Accounts only work on their own portal.</p>
+      </div>
+      <div class="portal-grid">
+        <a class="portal-card admin" href="/admin">
+          <div class="portal-icon">🏢</div>
+          <h2>Platform Admin</h2>
+          <p>Manage tenants, monitor AI agent, view platform metrics.</p>
+          <span class="portal-db">DB: central (metadata)</span>
+        </a>
+        <a class="portal-card kfc" href="/kfc">
+          <div class="portal-icon">🍗</div>
+          <h2>KFC</h2>
+          <p>Live orders, menu, and analytics for KFC only.</p>
+          <span class="portal-db">DB: tdb_kfc (isolated)</span>
+        </a>
+        <a class="portal-card kabab" href="/kababjees">
+          <div class="portal-icon">🍢</div>
+          <h2>Kababjees</h2>
+          <p>Live orders, menu, and analytics for Kababjees only.</p>
+          <span class="portal-db">DB: tdb_kababjees (isolated)</span>
+        </a>
+      </div>
+      <p class="landing-foot">API status: <a href="/health">/health</a> · <a href="/docs">API docs</a></p>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Restaurant OS — Agent API</title>
+    <link rel="stylesheet" href="/app/styles.css" />
+  </head>
+  <body>
+    <div class="landing-wrap">
+      <div class="landing-head">
+        <div class="logo"><span class="dot"></span> Restaurant OS</div>
+        <h1>AI Agent API</h1>
+        <p>This service runs the WhatsApp webhook and AI ordering agent. Restaurant dashboards are deployed as separate services.</p>
+      </div>
+      <div class="card" style="max-width:520px;padding:24px">
+        <h3 style="margin-bottom:12px">Separate portal services</h3>
+        <p style="color:var(--muted);font-size:14px;line-height:1.7;margin-bottom:12px">
+          Each restaurant has its own Railway web service and Postgres database:
+        </p>
+        <ul style="font-size:14px;line-height:2;color:var(--text);padding-left:20px">
+          <li><b>admin-web</b> — platform admin</li>
+          <li><b>kfc-web</b> — KFC dashboard</li>
+          <li><b>kababjees-web</b> — Kababjees dashboard</li>
+        </ul>
+        <p style="margin-top:14px;font-size:13px;color:var(--muted)">
+          Setup guide: <code>RAILWAY_SPLIT.md</code> in the repo.
+        </p>
+      </div>
+      <p class="landing-foot"><a href="/health">Health</a> · <a href="/docs">API docs</a> · <a href="/webhook">Webhook</a></p>
+    </div>
+  </body>
+</html>

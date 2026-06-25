@@ -1,106 +1,207 @@
+import asyncio
 import json
 import logging
 import re
+import time
 
 import google.generativeai as genai
 
 from app.config.settings import settings
-from app.data.restaurants import format_menus_for_prompt
-from app.services.session_service import get_session, reset_session, save_confirmed_order
+from app.data.restaurants import RESTAURANTS, format_menus_for_prompt
+from app.services.agent.prompts import build_system_prompt
+from app.services.catalog_service import get_menu_by_slug, get_menus_prompt_cached
+from app.services.order_routing import order_routing
+from app.services.session_service import get_session_async, reset_session_async, save_session_async
 
 logger = logging.getLogger(__name__)
 
-genai.configure(api_key=settings.gemini_api_key)
+_genai_configured = False
+_generation_config = genai.GenerationConfig(
+    max_output_tokens=400,
+    temperature=0.6,
+)
+
+FAST_GREETINGS = frozenset(
+    {"hi", "hello", "hey", "hii", "hola", "salam", "aoa", "assalamualaikum", "asalamualaikum"}
+)
 
 ORDER_JSON_PATTERN = re.compile(
     r"\[ORDER_JSON\]\s*(\{.*?\})\s*\[/ORDER_JSON\]",
     re.DOTALL,
 )
 
-SYSTEM_PROMPT = f"""You are a friendly WhatsApp ordering assistant for a restaurant management system.
 
-You serve TWO restaurants only:
-1. Kababjees — Pakistani BBQ & biryani
-2. KFC — Fried chicken & fast food
-
-MENUS (prices in PKR):
-{format_menus_for_prompt()}
-
-ORDER FLOW — follow these steps in order:
-1. Greet the customer and ask which restaurant they want: Kababjees or KFC.
-2. Once they choose, show that restaurant's full menu with item numbers and prices.
-3. Take their order — ask what items and quantities they want. Help them choose from the menu.
-4. Ask for their full name and delivery address.
-5. Show a clear order summary: restaurant, items with quantities, line totals, and grand total in PKR.
-6. Ask them to reply YES to confirm or NO to change the order.
-7. When they confirm with YES, thank them and say the order is placed. Estimate delivery 45-60 minutes.
-
-RULES:
-- Only offer items from the selected restaurant's menu. Do not invent items or prices.
-- Calculate totals correctly using the menu prices.
-- Keep replies concise and WhatsApp-friendly (short paragraphs, use line breaks).
-- Be polite and professional.
-- If the customer says "menu", show the menu again for their chosen restaurant.
-- If the customer says "reset" or "start over", greet them fresh and ask which restaurant again.
-- If they want to switch restaurants before confirming, allow it and show the new menu.
-- Currency is always PKR (Rs).
-- Do not use emojis.
-
-WHEN ORDER IS CONFIRMED (customer said YES after seeing summary), append this block at the very end of your message (customer must not see awkward formatting — keep the thank-you message natural above it):
-
-[ORDER_JSON]
-{{"restaurant": "kababjees or kfc", "customer_name": "...", "address": "...", "items": [{{"item": "...", "quantity": 1, "unit_price_pkr": 0, "line_total_pkr": 0}}], "total_pkr": 0}}
-[/ORDER_JSON]
-"""
-
-
-def _build_model() -> genai.GenerativeModel:
-    return genai.GenerativeModel(
-        settings.gemini_model,
-        system_instruction=SYSTEM_PROMPT,
-    )
+def _ensure_gemini_configured() -> None:
+    global _genai_configured
+    if not settings.gemini_api_key:
+        raise ValueError("GEMINI_API_KEY is not configured")
+    if not _genai_configured:
+        genai.configure(api_key=settings.gemini_api_key)
+        _genai_configured = True
 
 
 def _strip_order_json(text: str) -> tuple[str, dict | None]:
     match = ORDER_JSON_PATTERN.search(text)
     if not match:
         return text.strip(), None
-
     customer_text = ORDER_JSON_PATTERN.sub("", text).strip()
     try:
-        order = json.loads(match.group(1))
-        return customer_text, order
+        return customer_text, json.loads(match.group(1))
     except json.JSONDecodeError:
-        logger.exception("Failed to parse order JSON from AI response")
         return customer_text, None
 
 
-def process_order_message(phone: str, user_message: str) -> str:
+async def _persist_order(phone: str, order: dict) -> None:
+    slug = order.get("restaurant", "").lower().replace(" ", "")
+    slug_map = {"kababjees": "kababjees", "kfc": "kfc"}
+    slug = slug_map.get(slug, slug)
+    tenant_id, catalog = await get_menu_by_slug(slug)
+    if not tenant_id:
+        logger.warning("No tenant for restaurant %s — order kept in session only", slug)
+        return
+    catalog_by_name = {i["name"].lower(): i for i in catalog}
+    items = []
+    for item in order.get("items", []):
+        name = item.get("item", "")
+        cat = catalog_by_name.get(name.lower())
+        if cat:
+            items.append(
+                {
+                    "name": cat["name"],
+                    "quantity": int(item.get("quantity", 1)),
+                    "unit_price": cat["price"],
+                    "menu_item_id": cat.get("tenant_item_id"),
+                }
+            )
+        elif slug in RESTAURANTS:
+            for m in RESTAURANTS[slug]["menu"]:
+                if m["item"].lower() == name.lower():
+                    items.append(
+                        {
+                            "name": m["item"],
+                            "quantity": int(item.get("quantity", 1)),
+                            "unit_price": m["price_pkr"],
+                        }
+                    )
+                    break
+    if not items:
+        logger.warning("No valid items for order")
+        return
+    idem = f"{phone}:{slug}:{order.get('customer_name')}:{order.get('address')}"
+    result = await order_routing.create_order(
+        tenant_id,
+        customer_phone=phone,
+        customer_name=order.get("customer_name", ""),
+        delivery_address=order.get("address", ""),
+        items=items,
+        idempotency_key=idem,
+    )
+    from app.services.provisioning import enqueue_job
+    from app.services.realtime import publish_order_event
+
+    await enqueue_job("sync_outboxes", {"tenant_id": str(tenant_id)})
+    await publish_order_event(
+        tenant_id,
+        {"type": "order_created", "order_id": result["order_id"], "status": "placed"},
+    )
+    logger.info("Order persisted: %s", result)
+
+
+def _fast_greeting(menus: str) -> str:
+    if "KFC" in menus or "kfc" in menus:
+        return (
+            "Hello! Welcome to our ordering service.\n\n"
+            "We have KFC and Kababjees. Which restaurant would you like to order from?"
+        )
+    return (
+        "Hello! Welcome to our ordering service.\n\n"
+        "Which restaurant would you like to order from today?"
+    )
+
+
+def _call_gemini(system: str, history: list[dict], user_message: str) -> str:
+    _ensure_gemini_configured()
+    model = genai.GenerativeModel(
+        settings.gemini_model,
+        system_instruction=system,
+        generation_config=_generation_config,
+    )
+    chat = model.start_chat(history=history)
+    response = chat.send_message(user_message)
+    return (response.text or "").strip()
+
+
+async def process_order_message_async(phone: str, user_message: str) -> str:
+    t0 = time.perf_counter()
     normalized = user_message.strip().lower()
     if normalized in {"reset", "start over", "restart", "new order"}:
-        reset_session(phone)
+        await reset_session_async(phone)
 
-    session = get_session(phone)
+    session, menus = await asyncio.gather(
+        get_session_async(phone),
+        get_menus_prompt_cached(),
+    )
+
+    if normalized in FAST_GREETINGS and not session.history:
+        reply = _fast_greeting(menus)
+        session.history = [
+            {"role": "user", "parts": [user_message]},
+            {"role": "model", "parts": [reply]},
+        ]
+        asyncio.create_task(save_session_async(session))
+        logger.info("Fast greeting for %s in %.2fs", phone[:6] + "***", time.perf_counter() - t0)
+        return reply
+
+    system = build_system_prompt(menus) + """
+
+WHEN ORDER IS CONFIRMED (customer said YES), append at end:
+[ORDER_JSON]
+{"restaurant": "slug", "customer_name": "...", "address": "...", "items": [{"item": "...", "quantity": 1}]}
+[/ORDER_JSON]
+"""
+    history = []
+    for h in session.history:
+        role = "user" if h.get("role") == "user" else "model"
+        parts = h.get("parts", [])
+        text = parts[0] if parts else ""
+        history.append({"role": role, "parts": [text]})
 
     try:
-        model = _build_model()
-        chat = model.start_chat(history=session.history)
-        response = chat.send_message(user_message)
-        raw_text = (response.text or "").strip()
-
+        raw_text = await asyncio.to_thread(_call_gemini, system, history, user_message)
         if not raw_text:
             return settings.ai_fallback_message
 
-        session.history = chat.history[-20:]
+        session.history = [
+            {"role": "user", "parts": [user_message]},
+            {"role": "model", "parts": [raw_text[:500]]},
+        ] + session.history[-18:]
 
         customer_reply, order = _strip_order_json(raw_text)
         if order:
             order["phone"] = phone
-            save_confirmed_order(phone, order)
-            logger.info("Order confirmed for %s: %s", phone, json.dumps(order))
+            session.confirmed_orders.append(order)
+            asyncio.create_task(_persist_order(phone, order))
 
+        asyncio.create_task(save_session_async(session))
+        logger.info(
+            "Gemini reply for %s in %.2fs",
+            phone[:6] + "***",
+            time.perf_counter() - t0,
+        )
         return customer_reply or settings.ai_fallback_message
-
     except Exception:
-        logger.exception("Order agent failed for %s", phone)
+        logger.exception("Order agent failed after %.2fs", time.perf_counter() - t0)
         return settings.ai_fallback_message
+
+
+def process_order_message(phone: str, user_message: str) -> str:
+    try:
+        asyncio.get_running_loop()
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(asyncio.run, process_order_message_async(phone, user_message)).result(
+                timeout=60
+            )
+    except RuntimeError:
+        return asyncio.run(process_order_message_async(phone, user_message))

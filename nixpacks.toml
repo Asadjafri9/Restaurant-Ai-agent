@@ -1,0 +1,5 @@
+[phases.setup]
+nixPkgs = ["python312", "bash"]
+
+[start]
+cmd = "bash scripts/start_agent.sh"

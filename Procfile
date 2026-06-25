@@ -1,1 +1,2 @@
-web: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+web: bash scripts/start_agent.sh
+worker: python -m app.worker
