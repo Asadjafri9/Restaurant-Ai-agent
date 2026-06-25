@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 MENU_CACHE_TTL = 30
 MENUS_PROMPT_CACHE_TTL = 30
-MENUS_PROMPT_KEY = "menus_prompt:v2"
+MENUS_PROMPT_KEY = "menus_prompt:v3"
 
 
 async def invalidate_menu_caches(tenant_id: uuid.UUID | None = None) -> None:

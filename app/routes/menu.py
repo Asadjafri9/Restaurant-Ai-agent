@@ -83,10 +83,8 @@ async def list_items(ctx: TenantContext = Depends(get_tenant_ctx)) -> list[dict]
 
 async def _publish_outbox(ctx: TenantContext, action: str, item: MenuItem, category_name: str | None) -> None:
     from app.core.read_cache import invalidate_prefix
-    from app.services.catalog_service import invalidate_menu_caches
 
     await invalidate_prefix(f"api:menu:{ctx.tenant_id}")
-    await invalidate_menu_caches(ctx.tenant_id)
     payload = {
         "tenant_id": str(ctx.tenant_id),
         "tenant_item_id": str(item.id),
@@ -122,9 +120,9 @@ async def create_item(
         cat_name = cat.name if cat else None
     await _publish_outbox(ctx, "create", item, cat_name)
     await ctx.session.commit()
-    from app.services.provisioning import enqueue_job
+    from app.services.menu_sync import sync_menu_after_mutation
 
-    await enqueue_job("sync_outboxes", {"tenant_id": str(ctx.tenant_id)})
+    await sync_menu_after_mutation(ctx.tenant_id)
     return {"id": str(item.id), "name": item.name, "price": float(item.price)}
 
 
@@ -156,9 +154,9 @@ async def update_item(
         cat_name = cat.name if cat else None
     await _publish_outbox(ctx, "update", item, cat_name)
     await ctx.session.commit()
-    from app.services.provisioning import enqueue_job
+    from app.services.menu_sync import sync_menu_after_mutation
 
-    await enqueue_job("sync_outboxes", {"tenant_id": str(ctx.tenant_id)})
+    await sync_menu_after_mutation(ctx.tenant_id)
     return {"id": str(item.id), "name": item.name}
 
 
@@ -177,7 +175,7 @@ async def delete_item(
     item.is_available = False
     await _publish_outbox(ctx, "delete", item, None)
     await ctx.session.commit()
-    from app.services.provisioning import enqueue_job
+    from app.services.menu_sync import sync_menu_after_mutation
 
-    await enqueue_job("sync_outboxes", {"tenant_id": str(ctx.tenant_id)})
+    await sync_menu_after_mutation(ctx.tenant_id)
     return {"status": "deleted"}

@@ -12,5 +12,11 @@ $env:TENANT_DATABASE_URL = $env:DATABASE_URL
 Write-Host "[kfc] migrations..." -ForegroundColor Cyan
 python -m alembic -c migrations/tenant/alembic.ini upgrade head
 python scripts/seed_tenant.py
-Write-Host "[kfc] http://localhost:8002" -ForegroundColor Green
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8002 --reload --reload-dir app
+$port = 8002
+$bindTest = python -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',$port)); s.close()" 2>&1
+if ($LASTEXITCODE -ne 0) {
+    $port = 8004
+    Write-Host "[kfc] Port 8002 busy (stale socket?) — using $port" -ForegroundColor Yellow
+}
+Write-Host "[kfc] http://localhost:$port" -ForegroundColor Green
+python -m uvicorn app.main:app --host 127.0.0.1 --port $port --reload --reload-dir app

@@ -12,7 +12,7 @@ from app.core.security import hash_password
 from app.core.tenant_ids import TENANT_IDS
 from app.data.restaurants import RESTAURANTS
 from app.db.central import get_central_session
-from app.db.models_central import CatalogItem, Tenant, TenantConnection, User
+from app.db.models_central import Tenant, TenantConnection, User
 from app.db.tenant_router import provision_tenant_db
 
 
@@ -100,21 +100,6 @@ async def seed() -> None:
                     )
                 )
 
-            catalog = await session.execute(
-                select(CatalogItem).where(CatalogItem.tenant_id == tenant.id).limit(1)
-            )
-            if not catalog.scalar_one_or_none():
-                for item in data["menu"]:
-                    session.add(
-                        CatalogItem(
-                            tenant_id=tenant.id,
-                            tenant_item_id=uuid.uuid4(),
-                            name=item["item"],
-                            price=item["price_pkr"],
-                            is_available=True,
-                            category="Main",
-                        )
-                    )
             await session.commit()
 
         if external_url:
