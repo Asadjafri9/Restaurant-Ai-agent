@@ -16,7 +16,13 @@ def _get_engine() -> AsyncEngine:
         url = settings.async_database_url_tenant
         if not url:
             raise RuntimeError("DATABASE_URL / TENANT_DATABASE_URL not configured")
-        _engine = create_async_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=2)
+        _engine = create_async_engine(
+            url,
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=10,
+            pool_recycle=300,
+        )
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
     return _engine
 

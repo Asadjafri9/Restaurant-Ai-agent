@@ -57,24 +57,34 @@ async def create_category(
 
 @router.get("/items")
 async def list_items(ctx: TenantContext = Depends(get_tenant_ctx)) -> list[dict]:
-    result = await ctx.session.execute(
-        select(MenuItem).where(MenuItem.deleted_at.is_(None)).order_by(MenuItem.sort_order)
-    )
-    return [
-        {
-            "id": str(i.id),
-            "name": i.name,
-            "description": i.description,
-            "price": float(i.price),
-            "category_id": str(i.category_id) if i.category_id else None,
-            "is_available": i.is_available,
-            "sort_order": i.sort_order,
-        }
-        for i in result.scalars()
-    ]
+    from app.core.read_cache import cache_key, cached_json
+
+    key = cache_key("menu", str(ctx.tenant_id))
+
+    async def load() -> list[dict]:
+        result = await ctx.session.execute(
+            select(MenuItem).where(MenuItem.deleted_at.is_(None)).order_by(MenuItem.sort_order)
+        )
+        return [
+            {
+                "id": str(i.id),
+                "name": i.name,
+                "description": i.description,
+                "price": float(i.price),
+                "category_id": str(i.category_id) if i.category_id else None,
+                "is_available": i.is_available,
+                "sort_order": i.sort_order,
+            }
+            for i in result.scalars()
+        ]
+
+    return await cached_json(key, 30, load)
 
 
 async def _publish_outbox(ctx: TenantContext, action: str, item: MenuItem, category_name: str | None) -> None:
+    from app.core.read_cache import invalidate_prefix
+
+    await invalidate_prefix(f"api:menu:{ctx.tenant_id}")
     payload = {
         "tenant_id": str(ctx.tenant_id),
         "tenant_item_id": str(item.id),

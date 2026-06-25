@@ -14,7 +14,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.rpm = requests_per_minute
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path in ("/webhook", "/health", "/"):
+        path = request.url.path
+        if path in ("/webhook", "/health", "/") or path.startswith("/app/"):
+            return await call_next(request)
+        from app.config.settings import settings
+
+        if settings.environment == "development":
             return await call_next(request)
         client = request.client.host if request.client else "unknown"
         key = f"rl:{client}:{request.url.path}"

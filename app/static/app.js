@@ -6,12 +6,6 @@ const PORTAL_NAME = document.documentElement.dataset.name || "Restaurant OS";
 const IS_ADMIN_PORTAL = PORTAL === "admin";
 const IS_TENANT_PORTAL = PORTAL === "kfc" || PORTAL === "kababjees";
 
-const DEMO = {
-  admin: { email: "admin@platform.local", password: "admin123", label: "Admin" },
-  kfc: { email: "owner@kfc.local", password: "owner123", label: "KFC owner" },
-  kababjees: { email: "owner@kababjees.local", password: "owner123", label: "Kababjees owner" },
-};
-
 // ---------- API helpers ----------
 const API_BASE = "";
 const STORAGE = (key) => `${PORTAL}_${key}`;
@@ -111,6 +105,10 @@ function esc(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+function loadingBlock(lines = 3) {
+  return Array.from({ length: lines }, () => '<div class="skeleton" style="height:48px;margin-bottom:8px"></div>').join("");
+}
+
 // ---------- Layout ----------
 const TENANT_NAV = [
   { hash: "#/orders", label: "Live Orders", ic: "🧾" },
@@ -156,7 +154,6 @@ function renderLayout(activeHash, contentNode) {
 
 // ---------- Pages ----------
 function pageLogin() {
-  const demo = DEMO[PORTAL];
   const app = document.getElementById("app");
   app.innerHTML = "";
   const card = el(`
@@ -168,24 +165,20 @@ function pageLogin() {
         <div class="error-msg" id="err" style="display:none"></div>
         <div class="field">
           <label>Email</label>
-          <input type="email" id="email" placeholder="you@restaurant.com" required />
+          <input type="email" id="email" placeholder="you@restaurant.com" required autocomplete="username" />
         </div>
         <div class="field">
           <label>Password</label>
-          <input type="password" id="password" placeholder="••••••••" required />
+          <input type="password" id="password" placeholder="••••••••" required autocomplete="current-password" />
         </div>
         <button type="submit" class="btn">Sign in</button>
         <div class="hint">
-          <b>Demo account for this portal</b><br/>
-          ${demo ? `<code>${demo.email}</code> / <code>${demo.password}</code>` : "Contact admin"}
-          <br/><br/><a href="/">← Back to portal picker</a>
+          Use the email and password issued for this portal.<br/>
+          <a href="/">← Back to portal picker</a>
         </div>
       </form>
     </div>`);
   app.appendChild(card);
-  if (demo) {
-    card.querySelector("#email").value = demo.email;
-  }
   card.querySelector("#loginForm").onsubmit = async (e) => {
     e.preventDefault();
     const errEl = card.querySelector("#err");
@@ -208,6 +201,11 @@ function pageLogin() {
 const COLUMNS = ["placed", "accepted", "preparing", "out_for_delivery", "delivered"];
 const NEXT = { placed: "accepted", accepted: "preparing", preparing: "out_for_delivery", out_for_delivery: "delivered" };
 let _ws = null;
+let _wsTimer = null;
+function scheduleWsReload(fn) {
+  if (_wsTimer) clearTimeout(_wsTimer);
+  _wsTimer = setTimeout(fn, 400);
+}
 
 async function pageOrders() {
   const content = el(`
@@ -219,6 +217,8 @@ async function pageOrders() {
       <div class="kanban" id="kanban"></div>
     </div>`);
   renderLayout("#/orders", content);
+  const kanban = content.querySelector("#kanban");
+  kanban.innerHTML = loadingBlock(5);
 
   async function load() {
     let orders = [];
@@ -279,7 +279,7 @@ function connectWs(badge, onEvent) {
   _ws.onerror = () => { badge.className = "live-badge off"; badge.innerHTML = '<span class="pulse"></span> Offline'; };
   _ws.onmessage = (m) => {
     try { const ev = JSON.parse(m.data); if (ev.type === "order_created") toast("New order received!", "success"); } catch {}
-    onEvent();
+    scheduleWsReload(onEvent);
   };
 }
 
@@ -299,11 +299,12 @@ async function pageMenu() {
       </table>
     </div>`);
   renderLayout("#/menu", content);
+  const rows = content.querySelector("#rows");
+  rows.innerHTML = `<tr><td colspan="5">${loadingBlock(4)}</td></tr>`;
 
   async function load() {
     let items = [];
     try { items = await api("/menu/items"); } catch (e) { toast(e.message, "error"); return; }
-    const rows = content.querySelector("#rows");
     rows.innerHTML = "";
     if (!items.length) { rows.appendChild(el(`<tr><td colspan="5"><div class="empty">No menu items yet. Add your first item above.</div></td></tr>`)); return; }
     items.forEach((i) => {
@@ -377,6 +378,7 @@ async function pageAnalytics() {
       </div>
     </div>`);
   renderLayout("#/analytics", content);
+  content.querySelector("#kpis").innerHTML = loadingBlock(4);
 
   async function load() {
     destroyCharts();
@@ -386,16 +388,15 @@ async function pageAnalytics() {
       const from = new Date(Date.now() - days * 86400000).toISOString();
       qs = `?from=${encodeURIComponent(from)}`;
     }
-    let summary = {}, ts = [], top = [], byStatus = [], hours = [];
+    let dash;
     try {
-      [summary, ts, top, byStatus, hours] = await Promise.all([
-        api(`/analytics/summary${qs}`),
-        api(`/analytics/revenue-timeseries${qs}`),
-        api(`/analytics/top-items${qs}`),
-        api(`/analytics/orders-by-status${qs}`),
-        api(`/analytics/peak-hours${qs}`),
-      ]);
+      dash = await api(`/analytics/dashboard${qs}`);
     } catch (e) { toast(e.message, "error"); return; }
+    const summary = dash.summary || {};
+    const ts = dash.revenue_timeseries || [];
+    const top = dash.top_items || [];
+    const byStatus = dash.orders_by_status || [];
+    const hours = dash.peak_hours || [];
 
     const kpis = content.querySelector("#kpis");
     kpis.innerHTML = "";
@@ -448,11 +449,16 @@ async function pageAdmin() {
       </div>
     </div>`);
   renderLayout("#/admin", content);
+  content.querySelector("#kpis").innerHTML = loadingBlock(3);
+  content.querySelector("#rows").innerHTML = `<tr><td colspan="5">${loadingBlock(3)}</td></tr>`;
 
   async function load() {
     let ov = {}, tenants = [];
-    try { [ov, tenants] = await Promise.all([api("/admin/overview"), api("/admin/tenants")]); }
-    catch (e) { toast(e.message, "error"); return; }
+    try { const dash = await api("/admin/dashboard"); ov = dash.overview || {}; tenants = dash.tenants || []; }
+    catch (e) {
+      try { [ov, tenants] = await Promise.all([api("/admin/overview"), api("/admin/tenants")]); }
+      catch (err) { toast(err.message, "error"); return; }
+    }
     const kpis = content.querySelector("#kpis");
     kpis.innerHTML = "";
     [

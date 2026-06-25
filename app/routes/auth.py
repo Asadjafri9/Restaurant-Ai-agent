@@ -1,3 +1,4 @@
+import logging
 import secrets
 import uuid
 
@@ -18,7 +19,10 @@ from app.db.models_central import Tenant, User
 from app.db.models_tenant import StaffUser
 from app.db.redis_client import get_redis
 from app.db.standalone import get_standalone_session
+from app.core.logging import request_id_var
 from app.deps.auth import CurrentUser, get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -77,7 +81,7 @@ def _set_refresh_cookie(response: Response, portal: str, refresh: str) -> None:
         key=_portal_cookie(portal),
         value=refresh,
         httponly=True,
-        secure=True,
+        secure=settings.environment != "development",
         samesite="strict",
         max_age=7 * 86400,
         path=_cookie_path(),
@@ -87,8 +91,15 @@ def _set_refresh_cookie(response: Response, portal: str, refresh: str) -> None:
 async def _store_refresh(portal: str, jti: str, user_id: uuid.UUID) -> None:
     if not settings.redis_url:
         return
-    r = get_redis()
-    await r.setex(f"refresh:{portal}:{jti}", 7 * 86400, str(user_id))
+    try:
+        r = get_redis()
+        await r.setex(f"refresh:{portal}:{jti}", 7 * 86400, str(user_id))
+    except Exception:
+        logger.exception("Failed to store refresh token in Redis (portal=%s)", portal)
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service unavailable",
+        ) from None
 
 
 async def _revoke_refresh(portal: str, jti: str) -> None:
@@ -137,30 +148,39 @@ async def login(body: LoginRequest, response: Response) -> TokenResponse:
             _set_refresh_cookie(response, portal, refresh)
             return TokenResponse(access_token=access, role=staff.role, tenant_slug=tenant_slug)
 
-    async for session in get_central_session():
-        result = await session.execute(select(User).where(User.email == email))
-        user = result.scalar_one_or_none()
-        if not user or not user.is_active or not verify_password(password, user.password_hash):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        tenant_slug = None
-        if user.tenant_id:
-            tenant = await session.get(Tenant, user.tenant_id)
-            tenant_slug = tenant.slug if tenant else None
-        _check_portal_access(portal, user.role, user.tenant_id, tenant_slug)
-        jti = secrets.token_hex(16)
-        access = create_access_token(
-            user_id=user.id,
-            email=user.email,
-            role=user.role,
-            tenant_id=user.tenant_id,
-            tenant_slug=tenant_slug,
-            portal=portal,
+    try:
+        async for session in get_central_session():
+            result = await session.execute(select(User).where(User.email == email))
+            user = result.scalar_one_or_none()
+            if not user or not user.is_active or not verify_password(password, user.password_hash):
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            tenant_slug = None
+            if user.tenant_id:
+                tenant = await session.get(Tenant, user.tenant_id)
+                tenant_slug = tenant.slug if tenant else None
+            _check_portal_access(portal, user.role, user.tenant_id, tenant_slug)
+            jti = secrets.token_hex(16)
+            access = create_access_token(
+                user_id=user.id,
+                email=user.email,
+                role=user.role,
+                tenant_id=user.tenant_id,
+                tenant_slug=tenant_slug,
+                portal=portal,
+            )
+            refresh = create_refresh_token(user_id=user.id, jti=jti, tenant_id=user.tenant_id, portal=portal)
+            await _store_refresh(portal, jti, user.id)
+            _set_refresh_cookie(response, portal, refresh)
+            return TokenResponse(access_token=access, role=user.role, tenant_slug=tenant_slug)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "Login failed [correlation=%s]",
+            request_id_var.get() or "-",
         )
-        refresh = create_refresh_token(user_id=user.id, jti=jti, tenant_id=user.tenant_id, portal=portal)
-        await _store_refresh(portal, jti, user.id)
-        _set_refresh_cookie(response, portal, refresh)
-        return TokenResponse(access_token=access, role=user.role, tenant_slug=tenant_slug)
-    raise HTTPException(status_code=500, detail="Auth error")
+        raise HTTPException(status_code=503, detail="Authentication service unavailable") from None
+    raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
 
 @router.post("/refresh", response_model=TokenResponse)

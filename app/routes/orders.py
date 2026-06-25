@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.db.models_tenant import Customer, Order, OrderItem
@@ -52,29 +52,43 @@ async def order_board(
     ctx: TenantContext = Depends(get_tenant_ctx),
     _: object = Depends(require_role("owner", "manager", "staff")),
 ) -> list[dict]:
-    result = await ctx.session.execute(
-        select(Order)
-        .where(Order.status.in_(ACTIVE_STATUSES))
-        .order_by(Order.placed_at.desc())
-        .limit(100)
-    )
-    orders = result.scalars().all()
-    out = []
-    for o in orders:
-        items = (
-            await ctx.session.execute(select(OrderItem).where(OrderItem.order_id == o.id))
-        ).scalars().all()
-        out.append(
-            {
-                "id": str(o.id),
-                "status": o.status,
-                "total": float(o.total),
-                "placed_at": o.placed_at.isoformat(),
-                "item_count": len(items),
-                "delivery_address": o.delivery_address,
-            }
+    from app.core.read_cache import cache_key, cached_json
+
+    key = cache_key("board", str(ctx.tenant_id))
+
+    async def load() -> list[dict]:
+        item_count_sq = (
+            select(func.count(OrderItem.id))
+            .where(OrderItem.order_id == Order.id)
+            .correlate(Order)
+            .scalar_subquery()
         )
-    return out
+        result = await ctx.session.execute(
+            select(
+                Order.id,
+                Order.status,
+                Order.total,
+                Order.placed_at,
+                Order.delivery_address,
+                item_count_sq.label("item_count"),
+            )
+            .where(Order.status.in_(ACTIVE_STATUSES))
+            .order_by(Order.placed_at.desc())
+            .limit(100)
+        )
+        return [
+            {
+                "id": str(r.id),
+                "status": r.status,
+                "total": float(r.total),
+                "placed_at": r.placed_at.isoformat(),
+                "item_count": int(r.item_count or 0),
+                "delivery_address": r.delivery_address,
+            }
+            for r in result.all()
+        ]
+
+    return await cached_json(key, 5, load)
 
 
 @router.get("/{order_id}")
@@ -115,6 +129,9 @@ async def update_order_status(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    from app.core.read_cache import invalidate_prefix
+
+    await invalidate_prefix(f"api:board:{ctx.tenant_id}")
     await publish_order_event(
         ctx.tenant_id,
         {"type": "order_status_changed", "order_id": str(order_id), "status": body.status},

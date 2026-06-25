@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from starlette.middleware.gzip import GZipMiddleware
+
 from app.config.settings import settings
 from app.core.errors import AppError, error_response
 from app.core.logging import RequestIdFilter, new_request_id
@@ -61,8 +63,22 @@ async def check_whatsapp_token() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
+
     logging.getLogger().addFilter(RequestIdFilter())
     logger.info("Starting service_mode=%s", settings.service_mode)
+    # Warm DB/Redis pools so first dashboard request is not slow
+    try:
+        if settings.is_admin_service or settings.is_agent_service:
+            await check_central_db()
+        if settings.is_standalone_tenant:
+            from app.db.standalone import check_standalone_db
+
+            await check_standalone_db()
+        if settings.redis_url:
+            await check_redis()
+    except Exception:
+        logger.debug("Pool warmup skipped", exc_info=True)
     yield
     if settings.is_admin_service or settings.is_agent_service:
         await close_central_db()
@@ -74,6 +90,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=f"Restaurant OS ({settings.service_mode})", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -107,6 +124,14 @@ if settings.is_tenant_service:
         app.include_router(analytics_router, prefix="/api/v1")
     if ws_router:
         app.include_router(ws_router)
+
+
+@app.middleware("http")
+async def static_cache_middleware(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/app/"):
+        response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
 
 
 @app.middleware("http")
