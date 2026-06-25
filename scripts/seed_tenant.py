@@ -32,6 +32,9 @@ async def seed_tenant() -> None:
                 )
             )
             print(f"Seeded profile for {slug}")
+        elif profile.name != data["name"]:
+            profile.name = data["name"]
+            print(f"Fixed profile name for {slug} -> {data['name']}")
 
         staff = await session.execute(select(StaffUser).where(StaffUser.email == owner_email))
         if not staff.scalar_one_or_none():
@@ -45,7 +48,9 @@ async def seed_tenant() -> None:
             )
             print(f"Seeded staff user for {slug}")
 
-        existing_items = (await session.execute(select(MenuItem).limit(1))).scalar_one_or_none()
+        existing_items = (
+            await session.execute(select(MenuItem).where(MenuItem.deleted_at.is_(None)).limit(1))
+        ).scalar_one_or_none()
         if not existing_items:
             for item in data["menu"]:
                 session.add(
