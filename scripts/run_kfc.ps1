@@ -9,14 +9,26 @@ Get-Content $envFile | ForEach-Object {
 }
 $env:PYTHONPATH = $root
 $env:TENANT_DATABASE_URL = $env:DATABASE_URL
-Write-Host "[kfc] migrations..." -ForegroundColor Cyan
+Write-Host "kfc migrations..." -ForegroundColor Cyan
 python -m alembic -c migrations/tenant/alembic.ini upgrade head
 python scripts/seed_tenant.py
-$port = 8002
-$bindTest = python -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',$port)); s.close()" 2>&1
-if ($LASTEXITCODE -ne 0) {
-    $port = 8004
-    Write-Host "[kfc] Port 8002 busy (stale socket?) — using $port" -ForegroundColor Yellow
+
+function Test-PortFree($port) {
+    python -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',$port)); s.close()" 2>$null
+    return $LASTEXITCODE -eq 0
 }
-Write-Host "[kfc] http://localhost:$port" -ForegroundColor Green
+
+$port = $null
+foreach ($candidate in 8002, 8012, 8004, 8022) {
+    if (Test-PortFree $candidate) { $port = $candidate; break }
+}
+if (-not $port) {
+    Write-Host "No free port for KFC (tried 8002, 8012, 8004, 8022)" -ForegroundColor Red
+    exit 1
+}
+if ($port -ne 8002) {
+    Write-Host "Port 8002 blocked by stale socket - using $port" -ForegroundColor Yellow
+    Write-Host "Open http://localhost:$port (reboot PC to free port 8002)" -ForegroundColor Yellow
+}
+Write-Host "KFC portal: http://localhost:$port" -ForegroundColor Green
 python -m uvicorn app.main:app --host 127.0.0.1 --port $port --reload --reload-dir app
