@@ -83,8 +83,10 @@ async def list_items(ctx: TenantContext = Depends(get_tenant_ctx)) -> list[dict]
 
 async def _publish_outbox(ctx: TenantContext, action: str, item: MenuItem, category_name: str | None) -> None:
     from app.core.read_cache import invalidate_prefix
+    from app.services.catalog_service import invalidate_menu_caches
 
     await invalidate_prefix(f"api:menu:{ctx.tenant_id}")
+    await invalidate_menu_caches(ctx.tenant_id)
     payload = {
         "tenant_id": str(ctx.tenant_id),
         "tenant_item_id": str(item.id),

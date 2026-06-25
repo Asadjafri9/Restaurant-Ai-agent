@@ -5,9 +5,8 @@ import re
 import time
 
 from app.config.settings import settings
-from app.data.restaurants import RESTAURANTS, format_menus_for_prompt
 from app.services.agent.prompts import build_system_prompt
-from app.services.catalog_service import get_menu_by_slug, get_menus_prompt_cached
+from app.services.catalog_service import get_menu_by_slug, get_menus_prompt_cached, list_active_restaurants
 from app.services.llm_client import generate_reply, provider_label
 from app.services.order_routing import order_routing
 from app.services.session_service import get_session_async, reset_session_async, save_session_async
@@ -39,7 +38,7 @@ async def _persist_order(phone: str, order: dict) -> None:
     slug = order.get("restaurant", "").lower().replace(" ", "")
     slug_map = {"kababjees": "kababjees", "kfc": "kfc"}
     slug = slug_map.get(slug, slug)
-    tenant_id, catalog = await get_menu_by_slug(slug)
+    tenant_id, catalog = await get_menu_by_slug(slug, force_refresh=True)
     if not tenant_id:
         logger.warning("No tenant for restaurant %s — order kept in session only", slug)
         return
@@ -57,19 +56,8 @@ async def _persist_order(phone: str, order: dict) -> None:
                     "menu_item_id": cat.get("tenant_item_id"),
                 }
             )
-        elif slug in RESTAURANTS:
-            for m in RESTAURANTS[slug]["menu"]:
-                if m["item"].lower() == name.lower():
-                    items.append(
-                        {
-                            "name": m["item"],
-                            "quantity": int(item.get("quantity", 1)),
-                            "unit_price": m["price_pkr"],
-                        }
-                    )
-                    break
     if not items:
-        logger.warning("No valid items for order")
+        logger.warning("No valid menu items for order (slug=%s)", slug)
         return
     idem = f"{phone}:{slug}:{order.get('customer_name')}:{order.get('address')}"
     result = await order_routing.create_order(
@@ -91,15 +79,22 @@ async def _persist_order(phone: str, order: dict) -> None:
     logger.info("Order persisted: %s", result)
 
 
-def _fast_greeting(menus: str) -> str:
-    if "KFC" in menus or "kfc" in menus:
+def _fast_greeting(restaurants: list[dict]) -> str:
+    if not restaurants:
         return (
             "Hello! Welcome to our ordering service.\n\n"
-            "We have KFC and Kababjees. Which restaurant would you like to order from?"
+            "No restaurants are available right now. Please try again shortly."
         )
+    names = [r["name"] for r in restaurants]
+    if len(names) == 1:
+        list_text = names[0]
+    elif len(names) == 2:
+        list_text = f"{names[0]} and {names[1]}"
+    else:
+        list_text = ", ".join(names[:-1]) + f", and {names[-1]}"
     return (
-        "Hello! Welcome to our ordering service.\n\n"
-        "Which restaurant would you like to order from today?"
+        f"Hello! Welcome to our ordering service.\n\n"
+        f"We have {list_text}. Which restaurant would you like to order from?"
     )
 
 
@@ -109,13 +104,14 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
     if normalized in {"reset", "start over", "restart", "new order"}:
         await reset_session_async(phone)
 
-    session, menus = await asyncio.gather(
+    session, menus, restaurants = await asyncio.gather(
         get_session_async(phone),
-        get_menus_prompt_cached(),
+        get_menus_prompt_cached(force_refresh=normalized in {"reset", "start over", "restart", "new order"}),
+        list_active_restaurants(),
     )
 
     if normalized in FAST_GREETINGS and not session.history:
-        reply = _fast_greeting(menus)
+        reply = _fast_greeting(restaurants)
         session.history = [
             {"role": "user", "parts": [user_message]},
             {"role": "model", "parts": [reply]},
@@ -130,6 +126,8 @@ WHEN ORDER IS CONFIRMED (customer said YES), append at end:
 [ORDER_JSON]
 {"restaurant": "slug", "customer_name": "...", "address": "...", "items": [{"item": "...", "quantity": 1}]}
 [/ORDER_JSON]
+
+Use exact item names and prices from the LIVE MENUS section above. Never invent items.
 """
     history = []
     for h in session.history:
@@ -167,7 +165,7 @@ WHEN ORDER IS CONFIRMED (customer said YES), append at end:
         if "429" in err or "ResourceExhausted" in err or "quota" in err.lower():
             logger.warning("LLM quota exceeded, using fallback reply")
             if normalized in FAST_GREETINGS:
-                return _fast_greeting(menus)
+                return _fast_greeting(restaurants)
         logger.exception("Order agent failed after %.2fs", time.perf_counter() - t0)
         return settings.ai_fallback_message
 

@@ -48,8 +48,10 @@ ALLOWED_ORIGINS=http://localhost:8001,http://localhost:8002,http://localhost:800
 SERVICE_MODE=kfc
 ENVIRONMENT=development
 DATABASE_URL=$kfcDb
+DATABASE_URL_CENTRAL=$adminDb
 TENANT_ID=8c83eeeb-d7ee-5c0c-8ff7-30f1751134f6
 JWT_SECRET=$jwt
+FERNET_KEY=$fernet
 REDIS_URL=$redis
 ALLOWED_ORIGINS=http://localhost:8001,http://localhost:8002,http://localhost:8003
 "@ | Set-Content -Encoding utf8 "$localDir\kfc.env"
@@ -59,8 +61,10 @@ if ($kababDb) {
 SERVICE_MODE=kababjees
 ENVIRONMENT=development
 DATABASE_URL=$kababDb
+DATABASE_URL_CENTRAL=$adminDb
 TENANT_ID=fa19b25a-09cd-5e68-9166-1a7459f69b09
 JWT_SECRET=$jwt
+FERNET_KEY=$fernet
 REDIS_URL=$redis
 ALLOWED_ORIGINS=http://localhost:8001,http://localhost:8002,http://localhost:8003
 "@ | Set-Content -Encoding utf8 "$localDir\kababjees.env"

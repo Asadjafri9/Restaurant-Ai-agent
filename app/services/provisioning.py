@@ -16,12 +16,33 @@ QUEUE_KEY = "platform:jobs"
 
 
 async def enqueue_job(job_type: str, payload: dict) -> str:
+    import asyncio
+
     r = get_redis()
     job_id = str(uuid.uuid4())
     job = {"id": job_id, "type": job_type, "payload": payload}
     await r.lpush(QUEUE_KEY, json.dumps(job))
     logger.info("Enqueued job %s type=%s", job_id, job_type)
+    if job_type == "sync_outboxes":
+        tenant_id = uuid.UUID(payload["tenant_id"])
+        asyncio.create_task(_sync_outboxes_safe(tenant_id))
     return job_id
+
+
+async def _sync_outboxes_safe(tenant_id: uuid.UUID) -> None:
+    from app.config.settings import settings
+
+    if not settings.database_url_central:
+        logger.warning(
+            "Skipping inline outbox sync for %s: DATABASE_URL_CENTRAL not configured. "
+            "A worker with central access must process the outbox.",
+            tenant_id,
+        )
+        return
+    try:
+        await process_tenant_outboxes(tenant_id)
+    except Exception:
+        logger.exception("Inline outbox sync failed for tenant %s", tenant_id)
 
 
 async def process_provision_tenant(payload: dict) -> None:
@@ -103,8 +124,9 @@ async def process_menu_outbox(payload: dict) -> None:
                 await session.delete(item)
         await session.commit()
 
-    r = get_redis()
-    await r.delete(f"menu:{tenant_id}")
+    from app.services.catalog_service import invalidate_menu_caches
+
+    await invalidate_menu_caches(tenant_id)
 
 
 async def process_tenant_outboxes(tenant_id: uuid.UUID) -> None:

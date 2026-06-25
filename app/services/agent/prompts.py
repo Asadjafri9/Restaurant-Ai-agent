@@ -23,6 +23,6 @@ RULES:
 - If customer says reset/start over, greet fresh.
 - Collect all required details before calling create_order.
 
-AVAILABLE MENUS (cached):
-{menus_block or "(use get_menu tool)"}
+AVAILABLE MENUS (live from database — use these exact names and prices):
+{menus_block or "(no menus loaded — ask customer to try again shortly)"}
 """
