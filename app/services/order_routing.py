@@ -68,9 +68,13 @@ class OrderRoutingService:
                 unit_price = Decimal(str(item["unit_price"]))
                 line_total = unit_price * qty
                 subtotal += line_total
+                mid = item.get("menu_item_id")
+                menu_uuid = None
+                if mid:
+                    menu_uuid = uuid.UUID(mid) if isinstance(mid, str) else mid
                 order_items.append(
                     OrderItem(
-                        menu_item_id=item.get("menu_item_id"),
+                        menu_item_id=menu_uuid,
                         item_name_snapshot=item["name"],
                         unit_price_snapshot=unit_price,
                         quantity=qty,
@@ -91,7 +95,7 @@ class OrderRoutingService:
                 delivery_address=delivery_address,
                 notes=notes,
                 idempotency_key=idempotency_key,
-                source_agent="gemini-v1",
+                source_agent="whatsapp-agent",
             )
             session.add(order)
             for oi in order_items:
@@ -118,6 +122,10 @@ class OrderRoutingService:
             }
             session.add(RoutingOutbox(action="order_created", payload=outbox_payload))
             await session.commit()
+
+            from app.core.read_cache import invalidate_prefix
+
+            await invalidate_prefix(f"api:board:{tenant_id}")
 
             return {"order_id": str(order_id), "total": float(total), "status": "placed"}
 

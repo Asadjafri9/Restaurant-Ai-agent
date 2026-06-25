@@ -52,7 +52,7 @@ async def call_groq(system: str, history: list[dict], user_message: str) -> str:
                 "model": settings.groq_model,
                 "messages": messages,
                 "max_tokens": 400,
-                "temperature": 0.6,
+                "temperature": 0.2,
             },
         )
         response.raise_for_status()
@@ -67,7 +67,7 @@ def _call_gemini_sync(system: str, history: list[dict], user_message: str) -> st
     if not _genai_configured:
         genai.configure(api_key=settings.gemini_api_key)
         _genai_configured = True
-    generation_config = genai.GenerationConfig(max_output_tokens=400, temperature=0.6)
+    generation_config = genai.GenerationConfig(max_output_tokens=400, temperature=0.2)
     model = genai.GenerativeModel(
         settings.gemini_model,
         system_instruction=system,

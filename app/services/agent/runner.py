@@ -151,7 +151,10 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
     try:
         model = genai.GenerativeModel(
             settings.gemini_model,
-            system_instruction=build_system_prompt(menus_block),
+            system_instruction=build_system_prompt(
+                restaurants=await list_active_restaurants(),
+                menu_block=menus_block,
+            ),
             tools=TOOLS_DECL,
         )
         history = _history_to_gemini(session.history)

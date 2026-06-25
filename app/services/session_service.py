@@ -31,6 +31,7 @@ class CustomerSession:
   history: list[dict[str, Any]] = field(default_factory=list)
   confirmed_orders: list[dict[str, Any]] = field(default_factory=list)
   active_tenant_id: str | None = None
+  active_tenant_slug: str | None = None
   state: str = "greeting"
   updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -41,6 +42,7 @@ def _session_to_dict(session: CustomerSession) -> dict[str, Any]:
       "history": session.history,
       "confirmed_orders": session.confirmed_orders,
       "active_tenant_id": session.active_tenant_id,
+      "active_tenant_slug": session.active_tenant_slug,
       "state": session.state,
       "updated_at": session.updated_at.isoformat(),
   }
@@ -57,6 +59,7 @@ def _dict_to_session(data: dict[str, Any]) -> CustomerSession:
       history=data.get("history", []),
       confirmed_orders=data.get("confirmed_orders", []),
       active_tenant_id=data.get("active_tenant_id"),
+      active_tenant_slug=data.get("active_tenant_slug"),
       state=data.get("state", "greeting"),
       updated_at=updated_at,
   )
