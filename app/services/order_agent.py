@@ -41,49 +41,75 @@ def _strip_order_json(text: str) -> tuple[str, dict | None]:
 
 def _resolve_slug(text: str, restaurants: list[dict]) -> str | None:
     lower = text.lower()
-    for r in restaurants:
+    # Match longer slugs first (e.g. kababjees before kfc)
+    for r in sorted(restaurants, key=lambda x: len(x["slug"]), reverse=True):
         if r["slug"] in lower or r["name"].lower() in lower:
             return r["slug"]
+    # Common aliases
+    if "kabab" in lower or "kababjee" in lower:
+        return "kababjees"
+    if "kfc" in lower or "kentucky" in lower:
+        return "kfc"
     return None
 
 
-def _update_session_from_message(session, user_message: str, restaurants: list[dict]) -> None:
+def _apply_restaurant_choice(session, slug: str) -> bool:
+    """Set active restaurant; returns True if customer switched from another."""
+    switched = bool(session.active_tenant_slug and session.active_tenant_slug != slug)
+    session.active_tenant_slug = slug
+    session.active_tenant_id = str(TENANT_IDS.get(slug, ""))
+    session.state = "ordering"
+    if switched:
+        session.history = []
+    return switched
+
+
+def _update_session_from_message(session, user_message: str, restaurants: list[dict]) -> tuple[str | None, bool]:
+    """Update session state. Returns (slug, switched) if user picked/switched restaurant."""
     normalized = user_message.strip().lower()
     if normalized in {"reset", "start over", "restart", "new order"}:
         session.active_tenant_slug = None
         session.active_tenant_id = None
         session.state = "greeting"
-        return
+        session.history = []
+        return None, False
 
     slug = _resolve_slug(user_message, restaurants)
-    if slug and not session.active_tenant_slug:
-        session.active_tenant_slug = slug
-        session.active_tenant_id = str(TENANT_IDS.get(slug, ""))
-        session.state = "ordering"
+    if slug:
+        switched = _apply_restaurant_choice(session, slug)
+        return slug, switched
 
     if normalized in YES_WORDS and session.state in ("ordering", "confirming"):
         session.state = "confirming"
     elif normalized in NO_WORDS:
         session.state = "ordering"
+    return None, False
 
 
 async def _menu_block_for_session(session, restaurants: list[dict], user_message: str) -> str:
-    normalized = user_message.strip().lower()
-    wants_menu = any(k in normalized for k in MENU_KEYWORDS)
-
     if session.active_tenant_slug:
         _, items = await get_menu_by_slug(session.active_tenant_slug, force_refresh=True)
-        name = next((r["name"] for r in restaurants if r["slug"] == session.active_tenant_slug), session.active_tenant_slug)
-        if items and (session.state == "ordering" and (wants_menu or len(session.history) <= 2)):
-            return f"{name} ({session.active_tenant_slug}):\n{format_menu_text(items)}"
+        name = next(
+            (r["name"] for r in restaurants if r["slug"] == session.active_tenant_slug),
+            session.active_tenant_slug,
+        )
         if items:
-            # Compact reference — names and prices only, no re-listing instruction
-            lines = [f"{i['name']} Rs {i['price']:.0f}" for i in items]
-            return f"{name}: " + ", ".join(lines)
-        return f"{name}: (menu empty)"
+            return f"{name} ({session.active_tenant_slug}):\n{format_menu_text(items)}"
+        return f"{name} ({session.active_tenant_slug}): (menu empty)"
 
     lines = [f"- {r['name']} (slug: {r['slug']})" for r in restaurants]
     return "Available restaurants:\n" + "\n".join(lines)
+
+
+async def _reply_with_menu(slug: str, restaurants: list[dict], switched: bool) -> str | None:
+    """Deterministic menu reply when customer picks a restaurant — no LLM needed."""
+    _, items = await get_menu_by_slug(slug, force_refresh=True)
+    name = next((r["name"] for r in restaurants if r["slug"] == slug), slug)
+    if not items:
+        return f"Sorry, the {name} menu is empty right now. Please try again later or pick another restaurant."
+    intro = f"Sure, switching to {name}!" if switched else f"Great choice — {name}!"
+    menu = format_menu_text(items)
+    return f"{intro}\n\n{menu}\n\nWhat would you like to order?"
 
 
 async def _persist_order(phone: str, order: dict, session) -> dict | None:
@@ -170,7 +196,29 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
         list_active_restaurants(),
     )
 
-    _update_session_from_message(session, user_message, restaurants)
+    chosen_slug, switched = _update_session_from_message(session, user_message, restaurants)
+
+    # Deterministic reply when customer picks or switches restaurant
+    if chosen_slug:
+        menu_reply = await _reply_with_menu(chosen_slug, restaurants, switched)
+        if menu_reply:
+            session.history = [
+                {"role": "user", "parts": [user_message]},
+                {"role": "model", "parts": [menu_reply]},
+            ] + session.history[-14:]
+            await save_session_async(session)
+            logger.info("Menu reply for %s slug=%s in %.2fs", phone[:6] + "***", chosen_slug, time.perf_counter() - t0)
+            return menu_reply
+
+    if any(k in normalized for k in MENU_KEYWORDS) and session.active_tenant_slug:
+        menu_reply = await _reply_with_menu(session.active_tenant_slug, restaurants, False)
+        if menu_reply:
+            session.history = [
+                {"role": "user", "parts": [user_message]},
+                {"role": "model", "parts": [menu_reply]},
+            ] + session.history[-14:]
+            await save_session_async(session)
+            return menu_reply
 
     if normalized in FAST_GREETINGS and not session.history:
         reply = _fast_greeting(restaurants)
@@ -195,6 +243,7 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
         restaurants=restaurants,
         menu_block=menu_block,
         active_restaurant=active_name,
+        active_slug=session.active_tenant_slug,
         state=session.state,
     )
 
