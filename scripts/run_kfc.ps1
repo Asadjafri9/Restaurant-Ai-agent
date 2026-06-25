@@ -13,4 +13,4 @@ Write-Host "[kfc] migrations..." -ForegroundColor Cyan
 python -m alembic -c migrations/tenant/alembic.ini upgrade head
 python scripts/seed_tenant.py
 Write-Host "[kfc] http://localhost:8002" -ForegroundColor Green
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8002 --reload
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8002 --reload --reload-dir app

@@ -19,4 +19,4 @@ Write-Host "[kababjees] migrations..." -ForegroundColor Cyan
 python -m alembic -c migrations/tenant/alembic.ini upgrade head
 python scripts/seed_tenant.py
 Write-Host "[kababjees] http://localhost:8003" -ForegroundColor Green
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8003 --reload
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8003 --reload --reload-dir app

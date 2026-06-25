@@ -60,6 +60,10 @@ async def send_text_message(to: str, message: str) -> bool:
             response.raise_for_status()
             return True
     except httpx.HTTPStatusError:
+        if response.status_code == 401:
+            logger.error(
+                "WhatsApp access token invalid or expired — update WHATSAPP_ACCESS_TOKEN in .env and run scripts/sync_env_to_railway.ps1"
+            )
         logger.exception(
             "WhatsApp API error: %s",
             response.text if "response" in locals() else "unknown",
