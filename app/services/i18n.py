@@ -106,6 +106,21 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "en": "Here is the full menu. Would you like to order anything else?",
         "roman_ur": "Yeh poora menu hai. Kuch aur order karna chahte hain?",
     },
+    "items_added_now": {
+        "en": "Added: {items}.",
+        "roman_ur": "Add kar liya: {items}.",
+    },
+    "order_corrected": {
+        "en": "Sorry about that — I've corrected your order.",
+        "roman_ur": "Maafi chahte hain — order theek kar diya hai.",
+    },
+    "order_updated": {
+        "en": "Your order so far:\n{items}\n\nAnything else? When you're done, send your name and delivery address.",
+        "roman_ur": (
+            "Ab tak ka order:\n{items}\n\n"
+            "Kuch aur add karna hai? Ho jaye to naam aur delivery address bhej dein."
+        ),
+    },
     "order_confirmed": {
         "en": (
             "Order confirmed! Total: Rs {total:.0f}\n"

@@ -102,3 +102,52 @@ def test_extract_order_items_fuzzy_voice_name():
     assert len(items) == 1
     assert items[0]["item"] == "Chicken Biryani"
     assert items[0].get("menu_item_id") == "abc"
+
+
+def test_multi_item_list_with_fizz_up_next():
+    from app.data.restaurants import RESTAURANTS
+
+    catalog = [
+        {"name": i["item"], "price": i["price_pkr"], "tenant_item_id": str(i["id"])}
+        for i in RESTAURANTS["kfc"]["menu"]
+    ]
+    msg = "1 fiz up next 2 fries, 2 chicken piece, 1 zinger burger and 2 hot wings"
+    by_name = {i["item"]: i["quantity"] for i in extract_order_items(msg, catalog)}
+    assert by_name == {
+        "Fizz Up Next": 1,
+        "Fries (Large)": 2,
+        "Chicken Piece (1 pc)": 2,
+        "Zinger Burger": 1,
+        "Hot Wings (6 pcs)": 2,
+    }
+
+
+def test_order_correction_replaces_pending_items():
+    from app.data.restaurants import RESTAURANTS
+    from app.services.order_context import is_order_correction_message
+
+    catalog = [
+        {"name": i["item"], "price": i["price_pkr"], "tenant_item_id": str(i["id"])}
+        for i in RESTAURANTS["kfc"]["menu"]
+    ]
+    session = CustomerSession(
+        phone="+923001234567",
+        state="ordering",
+        active_tenant_slug="kfc",
+        pending_items=[
+            {"item": "Zinger Burger", "quantity": 2},
+            {"item": "Fries (Large)", "quantity": 2},
+        ],
+    )
+    correction = (
+        "you gave wrong order. 1 fiz up next 2 fries, 2 chicken piece, "
+        "1 zinger burger and 2 hot wings"
+    )
+    assert is_order_correction_message(correction)
+    update_pending_from_message(session, correction, catalog)
+    by_name = {i["item"]: i["quantity"] for i in session.pending_items}
+    assert by_name["Zinger Burger"] == 1
+    assert by_name["Fries (Large)"] == 2
+    assert by_name["Chicken Piece (1 pc)"] == 2
+    assert by_name["Hot Wings (6 pcs)"] == 2
+    assert by_name["Fizz Up Next"] == 1

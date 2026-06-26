@@ -19,6 +19,7 @@ RESTAURANTS = {
             {"id": 3, "item": "Family Bucket (9 pcs)", "price_pkr": 2200},
             {"id": 4, "item": "Fries (Large)", "price_pkr": 350},
             {"id": 5, "item": "Pepsi (1L)", "price_pkr": 200},
+            {"id": 8, "item": "Fizz Up Next", "price_pkr": 150},
             {"id": 6, "item": "Krusher", "price_pkr": 380},
             {"id": 7, "item": "Chicken Piece (1 pc)", "price_pkr": 320},
         ],

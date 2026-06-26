@@ -49,6 +49,26 @@ DONE_ADDING_PHRASES = (
     "nahi aur kuch",
 )
 
+ORDER_CORRECTION_MARKERS = (
+    "wrong order",
+    "order wrong",
+    "galat order",
+    "order galat",
+    "wrong items",
+    "galat hai",
+    "sahi nahi",
+    "not correct",
+    "incorrect order",
+    "you gave wrong",
+    "order is wrong",
+    "order s wrong",
+    "mistake in order",
+    "order mistake",
+    "galat dia",
+    "galat diya",
+    "theek nahi",
+)
+
 MORE_ITEMS_ASK_MARKERS = (
     "kuch aur",
     "kuch or",
@@ -101,6 +121,7 @@ _ITEM_TOKEN_ALIASES = {
     "briyani": "biryani",
     "biriyani": "biryani",
     "beriyani": "biryani",
+    "fiz": "fizz",
 }
 
 
@@ -199,57 +220,142 @@ def extract_address(text: str) -> str | None:
     return None
 
 
+def _catalog_base_name(name: str) -> str:
+    """Strip size/count suffixes — 'Hot Wings (6 pcs)' → 'hot wings'."""
+    stripped = re.sub(r"\([^)]*\)", "", name).strip()
+    base = normalize_user_text(stripped)
+    base = re.sub(r"\s+\d+\s*(pcs|pc|l)\b", "", base)
+    return re.sub(r"\s+", " ", base).strip()
+
+
+def _item_mentioned_in_text(normalized: str, cat_name: str, raw_text: str) -> bool:
+    name = normalize_user_text(cat_name)
+    base = _catalog_base_name(cat_name)
+    if name in normalized or base in normalized:
+        return True
+    base_tokens = [t for t in base.split() if len(t) > 2]
+    if len(base_tokens) >= 2 and all(t in normalized for t in base_tokens):
+        return True
+    if len(base_tokens) == 1 and len(base_tokens[0]) >= 4 and base_tokens[0] in normalized:
+        return True
+    return match_catalog_item(raw_text, [{"name": cat_name}]) is not None
+
+
+def is_order_correction_message(text: str) -> bool:
+    normalized = normalize_user_text(text)
+    if not normalized:
+        return False
+    return any(m in normalized for m in ORDER_CORRECTION_MARKERS)
+
+
+def _strip_correction_preamble(text: str) -> str:
+    normalized = normalize_user_text(text)
+    for marker in sorted(ORDER_CORRECTION_MARKERS, key=len, reverse=True):
+        if marker in normalized:
+            idx = normalized.find(marker)
+            tail = text[idx + len(marker) :].strip(" .,;:-")
+            if tail:
+                return tail
+    return text
+
+
+def _split_order_segments(text: str) -> list[str]:
+    """Split a multi-item order into per-item phrases (comma / and / aur)."""
+    cleaned = _strip_correction_preamble(text)
+    normalized = normalize_user_text(cleaned)
+    if not normalized:
+        return []
+    parts = re.split(r"\s*,\s*|\s+and\s+|\s+aur\s+", normalized)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _best_segment_for_item(text: str, cat_name: str, segments: list[str]) -> str | None:
+    raw = normalize_transcript(text)
+    for seg in segments:
+        seg_norm = normalize_user_text(seg)
+        if _item_mentioned_in_text(seg_norm, cat_name, seg):
+            return seg
+    whole = normalize_user_text(text)
+    if _item_mentioned_in_text(whole, cat_name, raw):
+        return text
+    return None
+
+
+def _quantity_from_segment(segment: str, base: str) -> int:
+    seg = normalize_user_text(segment)
+    patterns: list[str | None] = [
+        rf"(\d+)\s+{re.escape(base)}",
+        rf"(\d+)\s+{re.escape(base.split()[0])}" if base.split() else None,
+        rf"{re.escape(base)}\s+x\s*(\d+)",
+        r"^(\d+)\s+",
+    ]
+    for pat in patterns:
+        if not pat:
+            continue
+        m = re.search(pat, seg)
+        if m:
+            return max(1, int(m.group(1)))
+    if re.search(r"\b(teen|three|3)\b", seg):
+        return 3
+    if re.search(r"\b(do|two)\b", seg):
+        return 2
+    if re.search(r"\b(ek|aik|one)\b", seg):
+        return 1
+    return 1
+
+
 def extract_order_items(text: str, catalog: list[dict]) -> list[dict]:
     text = normalize_transcript(text)
     normalized = normalize_user_text(text)
     if not normalized or not catalog:
         return []
+    segments = _split_order_segments(text)
     found: list[dict] = []
     seen: set[str] = set()
-    for cat in catalog:
-        name = normalize_user_text(cat.get("name", ""))
-        if not name:
+    # Sort longest names first so "chicken piece" wins over bare "chicken".
+    sorted_catalog = sorted(catalog, key=lambda c: len(c.get("name", "")), reverse=True)
+    for cat in sorted_catalog:
+        cat_name = cat.get("name", "")
+        if not cat_name:
             continue
-        matched = name in normalized
-        if not matched:
-            tokens = [t for t in name.split() if len(t) > 2]
-            matched = len(tokens) >= 2 and all(t in normalized for t in tokens)
-        if not matched:
-            matched = match_catalog_item(text, [cat]) is not None
-        if matched:
-            key = cat["name"].lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            found.append(
-                {
-                    "item": cat["name"],
-                    "quantity": _extract_quantity(text, name),
-                    "menu_item_id": cat.get("tenant_item_id"),
-                    "unit_price": cat.get("price"),
-                }
-            )
+        segment = _best_segment_for_item(text, cat_name, segments)
+        if not segment:
+            continue
+        key = cat_name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        base = _catalog_base_name(cat_name)
+        found.append(
+            {
+                "item": cat_name,
+                "quantity": _extract_quantity(segment, base or normalize_user_text(cat_name)),
+                "menu_item_id": cat.get("tenant_item_id"),
+                "unit_price": cat.get("price"),
+            }
+        )
     return found
 
 
 def _extract_quantity(text: str, item_name: str) -> int:
-    normalized = normalize_user_text(text)
-    patterns = (
-        rf"(\d+)\s+{re.escape(item_name)}",
-        rf"{re.escape(item_name)}\s+x\s*(\d+)",
-        r"\b(ek|aik|one)\b",
-        r"\b(do|two|2)\b",
-        r"\b(teen|three|3)\b",
-    )
-    for pat in patterns[:2]:
-        m = re.search(pat, normalized)
-        if m:
-            return max(1, int(m.group(1)))
-    if re.search(r"\b(ek|aik|one)\b", normalized):
-        return 1
-    if re.search(r"\b(do|two)\b", normalized):
-        return 2
-    return 1
+    return _quantity_from_segment(text, _catalog_base_name(item_name) or normalize_user_text(item_name))
+
+
+def format_pending_items_list(items: list[dict]) -> str:
+    if not items:
+        return ""
+    return "\n".join(f"{int(i.get('quantity', 1))}x {i.get('item', '')}" for i in items)
+
+
+def pending_items_changed(before: list[dict], after: list[dict]) -> bool:
+    def sig(items: list[dict]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for i in items:
+            key = (i.get("item") or "").lower()
+            out[key] = out.get(key, 0) + int(i.get("quantity", 1))
+        return out
+
+    return sig(before) != sig(after)
 
 
 def is_done_adding_items(text: str) -> bool:
@@ -345,7 +451,7 @@ def format_order_summary(session, catalog: list[dict], lang: str) -> str:
     )
 
 
-def update_pending_from_message(session, user_message: str, catalog: list[dict]) -> None:
+def update_pending_from_message(session, user_message: str, catalog: list[dict], *, replace: bool = False) -> None:
     user_message = fix_name_transcript(user_message)
     name = extract_customer_name(user_message)
     if name:
@@ -355,7 +461,10 @@ def update_pending_from_message(session, user_message: str, catalog: list[dict])
         session.pending_address = address
     new_items = extract_order_items(user_message, catalog)
     if new_items:
-        session.pending_items = merge_pending_items(session.pending_items, new_items)
+        if replace or is_order_correction_message(user_message):
+            session.pending_items = new_items
+        else:
+            session.pending_items = merge_pending_items(session.pending_items, new_items)
 
 
 def clear_pending_order(session) -> None:

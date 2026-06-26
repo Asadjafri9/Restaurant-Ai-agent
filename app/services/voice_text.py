@@ -19,6 +19,8 @@ _TRANSCRIPT_REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bcola\s*next\b", re.I), "cola next"),
     (re.compile(r"\bcolla\s*next\b", re.I), "cola next"),
     (re.compile(r"\bkola\s*next\b", re.I), "cola next"),
+    (re.compile(r"\bfiz+\s*up\s*next\b", re.I), "fizz up next"),
+    (re.compile(r"\bfizz\s*up\b", re.I), "fizz up next"),
     (re.compile(r"\bblog\b", re.I), "block"),
     (re.compile(r"\bchkn\b", re.I), "chicken"),
     (re.compile(r"\bchiken\b", re.I), "chicken"),

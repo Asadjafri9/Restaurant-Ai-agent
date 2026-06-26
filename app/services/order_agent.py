@@ -13,12 +13,16 @@ from app.services.llm_client import LlmRateLimitError, generate_reply, provider_
 from app.services.order_context import (
     bot_asked_for_more_items,
     clear_pending_order,
+    extract_order_items,
     fix_name_transcript,
     format_order_summary,
+    format_pending_items_list,
     is_declining_more_items,
     is_done_adding_items,
+    is_order_correction_message,
     match_catalog_item,
     order_from_session,
+    pending_items_changed,
     pending_order_complete,
     update_pending_from_message,
 )
@@ -119,7 +123,16 @@ CONFIRM_PHRASES = (
     "confirm karna",
 )
 CONFIRM_SUMMARY_MARKERS = ("total", "rs ", "rs.", "grand total", "order summary", "kul ")
-CONFIRM_ASK_MARKERS = ("confirm", "yes", "han", "haan", "likhein", "reply", "theek", "bhejein", "karein")
+CONFIRM_ASK_MARKERS = (
+    "confirm karne",
+    "yes likhein",
+    "yes to confirm",
+    "han kardo likhein",
+    "reply yes",
+    "confirm karein",
+    "confirm karoon",
+    "order summary",
+)
 ORDER_DONE_MARKERS = (
     "order confirmed",
     "order confirm ho gaya",
@@ -170,6 +183,8 @@ def _is_yes_message(text: str) -> bool:
 
 
 def _is_no_message(text: str, session=None) -> bool:
+    if is_order_correction_message(text):
+        return False
     if is_done_adding_items(text):
         return False
     if session and session.pending_items and bot_asked_for_more_items(_last_model_text(session)):
@@ -195,13 +210,16 @@ def _last_model_text(session) -> str:
 def _conversation_awaiting_confirm(session) -> bool:
     if session.state == "confirming" or session.awaiting_confirm:
         return True
-    last = _last_model_text(session).lower()
+    last = _last_model_text(session)
     if not last:
+        return False
+    if bot_asked_for_more_items(last):
         return False
     if _looks_like_confirm_prompt(last):
         return True
-    has_summary = any(m in last for m in CONFIRM_SUMMARY_MARKERS)
-    asks_confirm = any(m in last for m in CONFIRM_ASK_MARKERS)
+    lower = last.lower()
+    has_summary = any(m in lower for m in CONFIRM_SUMMARY_MARKERS)
+    asks_confirm = any(m in lower for m in CONFIRM_ASK_MARKERS)
     return has_summary and asks_confirm
 
 
@@ -221,12 +239,21 @@ def _order_recently_completed(session) -> bool:
     return False
 
 
-def _is_confirm_reply(text: str, session) -> bool:
+def _is_confirm_reply(text: str, session, catalog: list[dict] | None = None) -> bool:
     """Broader YES when awaiting confirmation — catches garbled voice 'han kardo'."""
     if is_thank_you_message(text):
         return False
-    if _is_yes_message(text):
-        return True
+    last_bot = _last_model_text(session)
+    if bot_asked_for_more_items(last_bot):
+        return False
+    if catalog and extract_order_items(text, catalog):
+        return False
+    if catalog and message_mentions_items(text, catalog):
+        return False
+    if _is_yes_message(text) and not _looks_like_order_add_message(text):
+        if session.state == "confirming" or session.awaiting_confirm or _conversation_awaiting_confirm(session):
+            return True
+        return False
     if not (
         session.state == "confirming"
         or session.awaiting_confirm
@@ -234,6 +261,8 @@ def _is_confirm_reply(text: str, session) -> bool:
     ):
         return False
     if _is_no_message(text, session):
+        return False
+    if _looks_like_order_add_message(text):
         return False
     normalized = _normalize_user_text(normalize_confirm_transcript(text))
     if not normalized or len(normalized.split()) > 8:
@@ -243,6 +272,35 @@ def _is_confirm_reply(text: str, session) -> bool:
         return True
     confirm_phrases = ("han kardo", "haan kardo", "han kar do", "haan kar do", "confirm kardo", "kar do", "place order")
     return any(p in normalized for p in confirm_phrases)
+
+
+def _looks_like_order_add_message(text: str) -> bool:
+    """Voice/text that lists food items — not a bare YES."""
+    normalized = _normalize_user_text(text)
+    if not normalized:
+        return False
+    food_tokens = (
+        "burger",
+        "wings",
+        "pepsi",
+        "cola",
+        "biryani",
+        "kabab",
+        "zinger",
+        "krusher",
+        "piece",
+        "fries",
+        "chicken",
+        "karahi",
+        "roll",
+        "naan",
+        "menu",
+    )
+    if any(t in normalized for t in food_tokens):
+        return True
+    if "kardo" in normalized and len(normalized.split()) > 3:
+        return True
+    return False
 
 
 def _match_catalog_item(name: str, catalog_by_name: dict[str, dict]) -> dict | None:
@@ -304,7 +362,12 @@ def _update_session_from_message(session, user_message: str, restaurants: list[d
         return slug, switched
 
     awaiting = _conversation_awaiting_confirm(session)
-    if _is_confirm_reply(user_message, session) and (session.state in ("ordering", "confirming") or awaiting):
+    if (
+        _is_confirm_reply(user_message, session)
+        and (session.state in ("ordering", "confirming") or awaiting)
+        and not bot_asked_for_more_items(_last_model_text(session))
+        and not _looks_like_order_add_message(user_message)
+    ):
         session.state = "confirming"
     elif _is_no_message(user_message, session):
         session.state = "ordering"
@@ -397,6 +460,36 @@ async def _reply_with_menu(
     else:
         parts.append(msg("menu_ask", lang))
     return "\n\n".join(parts)
+
+
+async def _reply_after_items_added(
+    session,
+    lang: str,
+    *,
+    added_labels: str | None = None,
+    corrected: bool = False,
+) -> str:
+    items_text = format_pending_items_list(session.pending_items)
+    parts: list[str] = []
+    if corrected:
+        parts.append(msg("order_corrected", lang))
+    elif added_labels:
+        parts.append(msg("items_added_now", lang, items=added_labels))
+    parts.append(msg("order_updated", lang, items=items_text))
+    return "\n\n".join(parts)
+
+
+def _labels_for_new_items(before: list[dict], after: list[dict]) -> str:
+    before_sig = {i["item"].lower(): int(i.get("quantity", 1)) for i in before}
+    labels: list[str] = []
+    for item in after:
+        key = item["item"].lower()
+        qty = int(item.get("quantity", 1))
+        prev = before_sig.get(key, 0)
+        delta = qty - prev
+        if delta > 0:
+            labels.append(f"{delta}x {item['item']}")
+    return ", ".join(labels)
 
 
 async def _persist_order(phone: str, order: dict, session) -> dict | None:
@@ -642,7 +735,9 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
                 return menu_reply
 
     chosen_slug, switched = _update_session_from_message(session, user_message, restaurants)
-    is_yes = _is_confirm_reply(user_message, session)
+    if session.active_tenant_slug:
+        _, catalog_items = await get_menu_by_slug(session.active_tenant_slug, force_refresh=True)
+    is_yes = _is_confirm_reply(user_message, session, catalog_items)
     awaiting_confirm = _conversation_awaiting_confirm(session)
 
     detected_for_menu = _resolve_slug(user_message, restaurants)
@@ -712,6 +807,8 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
             return customer_reply
 
     menu_block = await _menu_block_for_session(session, restaurants, user_message)
+    pending_snapshot = list(session.pending_items)
+    order_correction = is_order_correction_message(user_message)
     if session.active_tenant_slug and not is_thank_you_message(user_message):
         _, catalog_items = await get_menu_by_slug(session.active_tenant_slug, force_refresh=True)
         update_pending_from_message(session, user_message, catalog_items)
@@ -722,6 +819,35 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
             session.pending_address,
             session.pending_items,
         )
+
+    if (
+        session.active_tenant_slug
+        and session.pending_items
+        and (
+            pending_items_changed(pending_snapshot, session.pending_items)
+            or order_correction
+        )
+        and not is_yes
+        and not is_menu_request(user_message)
+        and not is_done_adding_items(user_message)
+        and not is_declining_more_items(user_message, _last_model_text(session))
+    ):
+        added = None if order_correction else _labels_for_new_items(pending_snapshot, session.pending_items)
+        reply = await _reply_after_items_added(
+            session,
+            session.language,
+            added_labels=added or None,
+            corrected=order_correction,
+        )
+        session.state = "ordering"
+        session.awaiting_confirm = False
+        session.history = [
+            {"role": "user", "parts": [user_message]},
+            {"role": "model", "parts": [reply]},
+        ] + session.history[-16:]
+        await save_session_async(session)
+        logger.info("Items added for %s in %.2fs", phone[:6] + "***", time.perf_counter() - t0)
+        return reply
 
     menu_reply = await _try_serve_catalog_menu(session, user_message, restaurants)
     if menu_reply:
@@ -840,21 +966,21 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
                 order = None
             else:
                 raw_text = await generate_reply(system, history, user_message)
-            if not raw_text:
-                return _smart_fallback_reply(session, restaurants, catalog_items)
+                if not raw_text:
+                    return _smart_fallback_reply(session, restaurants, catalog_items)
 
-            customer_reply, order = _strip_order_json(raw_text)
+                customer_reply, order = _strip_order_json(raw_text)
 
-            if order:
-                order["phone"] = phone
-                if not order.get("restaurant") and session.active_tenant_slug:
-                    order["restaurant"] = session.active_tenant_slug
-                customer_reply = await _finalize_order(
-                    phone, order, session, persist_fail_message=persist_fail_message
-                )
-            elif _looks_like_confirm_prompt(customer_reply) or _order_summary_in_reply(customer_reply):
-                session.state = "confirming"
-                session.awaiting_confirm = True
+                if order:
+                    order["phone"] = phone
+                    if not order.get("restaurant") and session.active_tenant_slug:
+                        order["restaurant"] = session.active_tenant_slug
+                    customer_reply = await _finalize_order(
+                        phone, order, session, persist_fail_message=persist_fail_message
+                    )
+                elif _looks_like_confirm_prompt(customer_reply) or _order_summary_in_reply(customer_reply):
+                    session.state = "confirming"
+                    session.awaiting_confirm = True
 
         session.history = [
             {"role": "user", "parts": [user_message]},
