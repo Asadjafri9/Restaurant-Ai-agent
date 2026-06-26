@@ -13,7 +13,6 @@ from app.core.tenant_ids import TENANT_IDS
 from app.data.restaurants import RESTAURANTS
 from app.db.models_tenant import MenuItem, RestaurantProfile
 from app.db.standalone import close_standalone_db, get_standalone_session
-from app.services.menu_sync import sync_tenant_menu_to_central
 
 
 def _load_env_file(path: Path) -> None:
@@ -29,7 +28,52 @@ async def reset_menu(slug: str) -> None:
         raise RuntimeError(f"Unknown slug: {slug}")
 
     data = RESTAURANTS[slug]
-    tenant_id = TENANT_IDS[slug]
+
+    # Always rebuild central catalog
+    from scripts.seed_central_catalog import seed_central_for_slug
+
+    await seed_central_for_slug(slug)
+
+    # Only touch tenant menu_items when this slug has its own Postgres instance.
+    root = Path(__file__).resolve().parent.parent
+    other = "kfc" if slug == "kababjees" else "kababjees"
+    other_env = root / "local" / f"{other}.env"
+    shared = False
+    if other_env.exists():
+        from sqlalchemy import text
+
+        session = await get_standalone_session()
+        async with session:
+            mine = (
+                await session.execute(
+                    text("SELECT inet_server_addr()::text, pg_postmaster_start_time()::text")
+                )
+            ).one()
+        await close_standalone_db()
+        _load_env_file(other_env)
+        os.environ["SERVICE_MODE"] = other
+        get_settings.cache_clear()
+        session = await get_standalone_session()
+        async with session:
+            theirs = (
+                await session.execute(
+                    text("SELECT inet_server_addr()::text, pg_postmaster_start_time()::text")
+                )
+            ).one()
+        shared = mine == theirs
+        await close_standalone_db()
+        _load_env_file(root / "local" / f"{slug}.env")
+        os.environ["SERVICE_MODE"] = slug
+        os.environ["TENANT_DATABASE_URL"] = os.environ.get("DATABASE_URL", "")
+        get_settings.cache_clear()
+
+    if shared:
+        print(
+            f"Reset {slug} central catalog ({len(data['menu'])} items). "
+            "Skipped tenant DB — shared Postgres with other restaurant."
+        )
+        return
+
     session = await get_standalone_session()
     async with session:
         profile = (await session.execute(select(RestaurantProfile))).scalar_one_or_none()
@@ -62,8 +106,7 @@ async def reset_menu(slug: str) -> None:
             )
         await session.commit()
 
-    count = await sync_tenant_menu_to_central(tenant_id)
-    print(f"Reset {slug} menu ({len(data['menu'])} items) and synced {count} to central catalog.")
+    print(f"Reset {slug} menu ({len(data['menu'])} items) in tenant DB and central catalog.")
 
 
 async def main() -> None:

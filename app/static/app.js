@@ -44,7 +44,25 @@ async function api(path, options = {}) {
   };
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
-  const res = await fetch(`${API_BASE}/api/v1${path}`, { ...options, headers, credentials: "include" });
+  const timeoutMs = options.timeoutMs ?? 20000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(`${API_BASE}/api/v1${path}`, {
+      ...options,
+      headers,
+      credentials: "include",
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (e.name === "AbortError") {
+      throw new Error("Request timed out — the server may be restarting. Try Refresh in a few seconds.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   if (res.status === 401) {
     clearAuth();
     location.hash = "#/login";
@@ -109,6 +127,10 @@ function loadingBlock(lines = 3) {
   return Array.from({ length: lines }, () => '<div class="skeleton" style="height:48px;margin-bottom:8px"></div>').join("");
 }
 
+function clearPageOverlays() {
+  document.querySelectorAll(".modal-backdrop").forEach((node) => node.remove());
+}
+
 // ---------- Layout ----------
 const TENANT_NAV = [
   { hash: "#/orders", label: "Live Orders", ic: "🧾" },
@@ -118,6 +140,7 @@ const TENANT_NAV = [
 const ADMIN_NAV = [{ hash: "#/admin", label: "Overview", ic: "🏢" }];
 
 function renderLayout(activeHash, contentNode) {
+  clearPageOverlays();
   const nav = IS_ADMIN_PORTAL ? ADMIN_NAV : TENANT_NAV;
   const email = localStorage.getItem(STORAGE("email")) || "";
   const role = getRole() || "";
@@ -154,6 +177,7 @@ function renderLayout(activeHash, contentNode) {
 
 // ---------- Pages ----------
 function pageLogin() {
+  clearPageOverlays();
   const app = document.getElementById("app");
   app.innerHTML = "";
   const card = el(`
@@ -198,88 +222,208 @@ function pageLogin() {
   };
 }
 
-const COLUMNS = ["placed", "accepted", "preparing", "out_for_delivery", "delivered"];
-const NEXT = { placed: "accepted", accepted: "preparing", preparing: "out_for_delivery", out_for_delivery: "delivered" };
+const COLUMNS = ["placed", "accepted", "out_for_delivery", "delivered"];
+const NEXT = { placed: "accepted", accepted: "out_for_delivery", preparing: "out_for_delivery", out_for_delivery: "delivered" };
+const COL_LABELS = {
+  placed: "New orders",
+  accepted: "Accepted",
+  out_for_delivery: "On the way",
+  delivered: "Delivered",
+};
+const NEXT_LABELS = {
+  placed: "Accept order",
+  accepted: "Out for delivery",
+  preparing: "Out for delivery",
+  out_for_delivery: "Mark delivered",
+};
+
+function columnForStatus(status) {
+  if (status === "preparing") return "accepted";
+  return status;
+}
 let _ws = null;
 let _wsTimer = null;
+let _wsReconnectTimer = null;
+let _wsPollTimer = null;
+let _wsRetries = 0;
+
 function scheduleWsReload(fn) {
   if (_wsTimer) clearTimeout(_wsTimer);
-  _wsTimer = setTimeout(fn, 400);
+  _wsTimer = setTimeout(fn, 300);
+}
+
+function stopWsPoll() {
+  if (_wsPollTimer) {
+    clearInterval(_wsPollTimer);
+    _wsPollTimer = null;
+  }
+}
+
+function startWsPoll(onEvent) {
+  if (_wsPollTimer) return;
+  _wsPollTimer = setInterval(() => onEvent({ refresh: true }), 12000);
 }
 
 async function pageOrders() {
   const content = el(`
     <div>
       <div class="page-head">
-        <h2>Live Orders</h2>
-        <span class="live-badge off" id="liveBadge"><span class="pulse"></span> connecting…</span>
+        <div>
+          <h2>Live Orders</h2>
+          <p class="page-sub" id="orderSummary">Loading orders…</p>
+        </div>
+        <div class="page-head-actions">
+          <button class="btn btn-sm btn-ghost" id="refreshBtn" type="button">↻ Refresh</button>
+          <span class="live-badge off" id="liveBadge"><span class="pulse"></span> connecting…</span>
+        </div>
       </div>
       <div class="kanban" id="kanban"></div>
     </div>`);
   renderLayout("#/orders", content);
   const kanban = content.querySelector("#kanban");
+  const summary = content.querySelector("#orderSummary");
   kanban.innerHTML = loadingBlock(5);
 
-  async function load() {
+  async function load(opts = {}) {
+    const path = "/orders/board?nocache=1";
     let orders = [];
-    try { orders = await api("/orders/board"); } catch (e) { toast(e.message, "error"); return; }
-    const kanban = content.querySelector("#kanban");
+    try { orders = await api(path); } catch (e) {
+      toast(e.message, "error");
+      summary.textContent = "Could not load orders";
+      kanban.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      return;
+    }
+    const active = orders.filter((o) => o.status !== "delivered");
+    summary.textContent = active.length
+      ? `${active.length} active order${active.length === 1 ? "" : "s"} · updates appear automatically`
+      : "No active orders — new WhatsApp orders will show here instantly";
+
     kanban.innerHTML = "";
     COLUMNS.forEach((col) => {
-      const list = orders.filter((o) => o.status === col);
-      const colEl = el(`<div class="kcol"><h3>${col.replace(/_/g, " ")} <span class="count">${list.length}</span></h3></div>`);
+      const list = orders.filter((o) => columnForStatus(o.status) === col);
+      const colEl = el(`
+        <div class="kcol" data-status="${col}">
+          <div class="kcol-head">
+            <h3>${COL_LABELS[col] || col}</h3>
+            <span class="count">${list.length}</span>
+          </div>
+          <div class="kcol-body"></div>
+        </div>`);
+      const body = colEl.querySelector(".kcol-body");
+      if (!list.length) {
+        body.appendChild(el(`<div class="kcol-empty">No orders here</div>`));
+      }
       list.forEach((o) => {
+        const items = o.items || [];
+        const itemsHtml = items.length
+          ? `<ul class="ocard-items">${items.map((i) => `<li>${i.quantity}× ${esc(i.name)}</li>`).join("")}</ul>`
+          : `<div class="ocard-items empty">No items listed</div>`;
         const card = el(`
-          <div class="ocard">
-            <div class="id">#${o.id.slice(0, 8)}</div>
-            <div class="total">${fmtMoney(o.total)}</div>
-            <div class="addr">${esc(o.delivery_address || "")}</div>
-            <div class="time">${o.item_count || 0} items · ${fmtTime(o.placed_at)}</div>
+          <div class="ocard" data-order-id="${esc(o.id)}">
+            <div class="ocard-top">
+              <div class="id">#${o.id.slice(0, 8)}</div>
+              <div class="total">${fmtMoney(o.total)}</div>
+            </div>
+            <div class="customer">${esc(o.customer_name || "Customer")}</div>
+            <div class="addr">${esc(o.delivery_address || "No address")}</div>
+            ${itemsHtml}
+            <div class="meta">${o.item_count || items.length || 0} item${(o.item_count || items.length || 0) === 1 ? "" : "s"} · ${fmtTime(o.placed_at)}</div>
           </div>`);
         if (NEXT[o.status]) {
           const acts = el(`<div class="acts"></div>`);
-          const adv = el(`<button class="btn btn-sm">Advance →</button>`);
+          const adv = el(`<button class="btn btn-sm btn-advance" type="button">${NEXT_LABELS[o.status] || "Advance"}</button>`);
           adv.onclick = async () => {
+            adv.disabled = true;
+            adv.textContent = "Updating…";
             try {
               await api(`/orders/${o.id}/status`, { method: "PATCH", body: JSON.stringify({ status: NEXT[o.status] }) });
-              load();
-            } catch (e) { toast(e.message, "error"); }
+              await load({ refresh: true });
+            } catch (e) {
+              toast(e.message, "error");
+              adv.disabled = false;
+              adv.textContent = NEXT_LABELS[o.status] || "Advance";
+            }
           };
           acts.appendChild(adv);
           if (o.status !== "delivered") {
-            const cancel = el(`<button class="btn btn-sm btn-ghost">✕</button>`);
+            const cancel = el(`<button class="btn btn-sm btn-ghost btn-cancel" type="button" title="Cancel order">Cancel</button>`);
             cancel.onclick = async () => {
+              if (!confirm("Cancel this order?")) return;
               try {
                 await api(`/orders/${o.id}/status`, { method: "PATCH", body: JSON.stringify({ status: "cancelled" }) });
-                load();
+                await load({ refresh: true });
               } catch (e) { toast(e.message, "error"); }
             };
             acts.appendChild(cancel);
           }
           card.appendChild(acts);
         }
-        colEl.appendChild(card);
+        body.appendChild(card);
       });
       kanban.appendChild(colEl);
     });
   }
 
+  content.querySelector("#refreshBtn").onclick = () => load({ refresh: true });
+
   await load();
-  connectWs(content.querySelector("#liveBadge"), load);
+  connectWs(content.querySelector("#liveBadge"), () => load({ refresh: true }));
 }
+
+let _wsConnectTimer = null;
 
 function connectWs(badge, onEvent) {
   const token = getToken();
   if (!token) return;
+  if (_wsReconnectTimer) {
+    clearTimeout(_wsReconnectTimer);
+    _wsReconnectTimer = null;
+  }
+  if (_wsConnectTimer) {
+    clearTimeout(_wsConnectTimer);
+    _wsConnectTimer = null;
+  }
   try { if (_ws) _ws.close(); } catch {}
   const wsBase = location.origin.replace(/^http/, "ws");
   _ws = new WebSocket(`${wsBase}/ws/orders`, [`access.${token}`]);
-  _ws.onopen = () => { badge.className = "live-badge"; badge.innerHTML = '<span class="pulse"></span> Live'; };
-  _ws.onclose = () => { badge.className = "live-badge off"; badge.innerHTML = '<span class="pulse"></span> Offline'; };
-  _ws.onerror = () => { badge.className = "live-badge off"; badge.innerHTML = '<span class="pulse"></span> Offline'; };
+  _wsConnectTimer = setTimeout(() => {
+    if (_ws && _ws.readyState === WebSocket.CONNECTING) {
+      try { _ws.close(); } catch {}
+      badge.className = "live-badge off";
+      badge.innerHTML = '<span class="pulse"></span> Offline · polling';
+      startWsPoll(onEvent);
+    }
+  }, 10000);
+  _ws.onopen = () => {
+    if (_wsConnectTimer) { clearTimeout(_wsConnectTimer); _wsConnectTimer = null; }
+    _wsRetries = 0;
+    stopWsPoll();
+    badge.className = "live-badge";
+    badge.innerHTML = '<span class="pulse"></span> Live';
+    onEvent({ refresh: true });
+  };
+  _ws.onclose = () => {
+    if (_wsConnectTimer) { clearTimeout(_wsConnectTimer); _wsConnectTimer = null; }
+    badge.className = "live-badge off";
+    badge.innerHTML = '<span class="pulse"></span> Reconnecting…';
+    startWsPoll(onEvent);
+    const delay = Math.min(30000, 2000 * Math.pow(2, _wsRetries++));
+    _wsReconnectTimer = setTimeout(() => connectWs(badge, onEvent), delay);
+  };
+  _ws.onerror = () => {
+    badge.className = "live-badge off";
+    badge.innerHTML = '<span class="pulse"></span> Reconnecting…';
+  };
   _ws.onmessage = (m) => {
-    try { const ev = JSON.parse(m.data); if (ev.type === "order_created") toast("New order received!", "success"); } catch {}
-    scheduleWsReload(onEvent);
+    try {
+      const ev = JSON.parse(m.data);
+      if (ev.type === "order_created") {
+        toast("New order received!", "success");
+      } else if (ev.type === "order_status_changed") {
+        toast("Order updated", "info");
+      }
+    } catch {}
+    scheduleWsReload(() => onEvent({ refresh: true }));
   };
 }
 
@@ -355,6 +499,22 @@ async function pageMenu() {
 let _charts = [];
 function destroyCharts() { _charts.forEach((c) => { try { c.destroy(); } catch {} }); _charts = []; }
 
+function analyticsRangeQuery(days) {
+  if (!days) return "";
+  const map = { 1: "today", 7: "7d", 30: "30d" };
+  const range = map[Number(days)] || days;
+  return `?range=${encodeURIComponent(range)}&_=${Date.now()}`;
+}
+
+function formatChartBucket(iso, days) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (days === "1") {
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  return d.toLocaleDateString([], { month: "2-digit", day: "2-digit" });
+}
+
 async function pageAnalytics() {
   const content = el(`
     <div>
@@ -380,37 +540,37 @@ async function pageAnalytics() {
   renderLayout("#/analytics", content);
   content.querySelector("#kpis").innerHTML = loadingBlock(4);
 
+  let loadSeq = 0;
   async function load() {
+    const seq = ++loadSeq;
     destroyCharts();
+    const kpisEl = content.querySelector("#kpis");
+    kpisEl.innerHTML = loadingBlock(4);
     const days = content.querySelector("#range").value;
-    let qs = "";
-    if (days) {
-      const from = new Date(Date.now() - days * 86400000).toISOString();
-      qs = `?from=${encodeURIComponent(from)}`;
-    }
+    const qs = analyticsRangeQuery(days);
     let dash;
     try {
       dash = await api(`/analytics/dashboard${qs}`);
     } catch (e) { toast(e.message, "error"); return; }
+    if (seq !== loadSeq) return;
     const summary = dash.summary || {};
     const ts = dash.revenue_timeseries || [];
     const top = dash.top_items || [];
     const byStatus = dash.orders_by_status || [];
     const hours = dash.peak_hours || [];
 
-    const kpis = content.querySelector("#kpis");
-    kpis.innerHTML = "";
+    kpisEl.innerHTML = "";
     [
       ["Revenue", fmtMoney(summary.revenue)],
       ["Orders", summary.orders_count || 0],
       ["Avg order value", fmtMoney(Math.round(summary.avg_order_value || 0))],
       ["Items sold", summary.items_sold || 0],
-    ].forEach(([l, v]) => kpis.appendChild(el(`<div class="kpi"><div class="label">${l}</div><div class="value">${v}</div></div>`)));
+    ].forEach(([l, v]) => kpisEl.appendChild(el(`<div class="kpi"><div class="label">${l}</div><div class="value">${v}</div></div>`)));
 
     const P = "#4f46e5";
     _charts.push(new Chart(content.querySelector("#revChart"), {
       type: "line",
-      data: { labels: ts.map((t) => (t.bucket || "").slice(5, 10)), datasets: [{ label: "Revenue", data: ts.map((t) => t.revenue), borderColor: P, backgroundColor: "rgba(79,70,229,0.1)", fill: true, tension: 0.3 }] },
+      data: { labels: ts.map((t) => formatChartBucket(t.bucket, days)), datasets: [{ label: "Revenue", data: ts.map((t) => t.revenue), borderColor: P, backgroundColor: "rgba(79,70,229,0.1)", fill: true, tension: 0.3 }] },
       options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } },
     }));
     _charts.push(new Chart(content.querySelector("#topChart"), {
@@ -518,10 +678,18 @@ function defaultRoute() {
 
 function router() {
   if (_ws) { try { _ws.close(); } catch {} _ws = null; }
+  if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
+  if (_wsConnectTimer) { clearTimeout(_wsConnectTimer); _wsConnectTimer = null; }
+  if (_wsTimer) { clearTimeout(_wsTimer); _wsTimer = null; }
+  stopWsPoll();
   destroyCharts();
   const hash = location.hash || "#/login";
   const authed = !!getToken();
-  if (!authed && hash !== "#/login") { location.hash = "#/login"; return; }
+  if (!authed && hash !== "#/login") {
+    clearPageOverlays();
+    location.hash = "#/login";
+    return;
+  }
   if (authed && hash === "#/login") { location.hash = defaultRoute(); return; }
 
   if (IS_ADMIN_PORTAL) {
@@ -553,4 +721,7 @@ function router() {
 
 window.addEventListener("hashchange", router);
 window.addEventListener("DOMContentLoaded", router);
+window.addEventListener("pageshow", (e) => {
+  if (e.persisted) clearPageOverlays();
+});
 router();

@@ -1,0 +1,104 @@
+from app.services.order_agent import _is_no_message
+from app.services.order_context import (
+    extract_address,
+    extract_customer_name,
+    extract_order_items,
+    fix_name_transcript,
+    is_done_adding_items,
+    merge_pending_items,
+    pending_order_complete,
+    update_pending_from_message,
+)
+from app.services.session_service import CustomerSession
+
+
+def test_fix_kareer_to_askari():
+    assert "Askari" in fix_name_transcript("kareer bhai")
+
+
+def test_extract_name_explicit():
+    assert extract_customer_name("mera naam askari hai") == "Askari"
+    assert extract_customer_name("Askari") == "Askari"
+
+
+def test_extract_name_not_from_address():
+    assert extract_customer_name("Block C5") is None
+
+
+def test_extract_address():
+    assert extract_address("mera naam askari hai block c5 address hai") == "Block C5"
+    assert extract_address("Block C5") == "Block C5"
+
+
+def test_done_adding_not_treated_as_cancel():
+    assert is_done_adding_items("nahi bas itna hi kardo")
+    assert not _is_no_message("nahi bas itna hi kardo")
+
+
+def test_nahi_karna_when_asked_for_more_is_done_adding():
+    from app.services.order_agent import _last_model_text
+    from app.services.order_context import is_declining_more_items
+
+    session = CustomerSession(
+        phone="+923001234567",
+        state="ordering",
+        active_tenant_slug="kababjees",
+        pending_items=[{"item": "Chicken Biryani", "quantity": 1}],
+        history=[
+            {"role": "model", "parts": ["Kya aap kuch aur order karna chahte hain?"]},
+        ],
+    )
+    assert is_declining_more_items("nahi karna", _last_model_text(session))
+    assert not _is_no_message("nahi karna", session)
+    assert is_done_adding_items("nahi karna")
+
+
+def test_pending_order_tracking():
+    session = CustomerSession(phone="+923001234567", active_tenant_slug="kfc")
+    catalog = [{"name": "Cola Next", "price": 100}]
+    update_pending_from_message(session, "jani kfc se cola next kardo", catalog)
+    assert session.pending_items
+    update_pending_from_message(session, "Askari", catalog)
+    assert session.pending_customer_name == "Askari"
+    update_pending_from_message(session, "mera naam askari hai block c5 address hai", catalog)
+    assert session.pending_customer_name == "Askari"
+    assert session.pending_address == "Block C5"
+    assert pending_order_complete(session)
+
+
+def test_name_correction_overwrites_kareer():
+    session = CustomerSession(phone="+923001234567")
+    update_pending_from_message(session, "Kareer", [])
+    assert session.pending_customer_name == "Askari"
+    update_pending_from_message(session, "mera naam askari hai", [])
+    assert session.pending_customer_name == "Askari"
+
+
+def test_extract_name_not_from_thank_you():
+    assert extract_customer_name("shukriya") is None
+    assert extract_customer_name("thank you") is None
+
+
+def test_merge_items():
+    merged = merge_pending_items(
+        [{"item": "Cola Next", "quantity": 1, "unit_price": 100}],
+        [{"item": "Cola Next", "quantity": 1, "unit_price": 100}],
+    )
+    assert merged[0]["quantity"] == 2
+
+
+def test_match_chkn_briyani_to_chicken_biryani():
+    from app.services.order_context import match_catalog_item
+
+    catalog = [{"name": "Chicken Biryani", "price": 450, "tenant_item_id": "abc"}]
+    hit = match_catalog_item("chkn briyani", catalog)
+    assert hit is not None
+    assert hit["name"] == "Chicken Biryani"
+
+
+def test_extract_order_items_fuzzy_voice_name():
+    catalog = [{"name": "Chicken Biryani", "price": 450, "tenant_item_id": "abc"}]
+    items = extract_order_items("ek chkn briyani chahiye", catalog)
+    assert len(items) == 1
+    assert items[0]["item"] == "Chicken Biryani"
+    assert items[0].get("menu_item_id") == "abc"

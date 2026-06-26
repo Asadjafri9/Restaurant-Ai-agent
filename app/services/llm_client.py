@@ -1,5 +1,6 @@
-"""LLM client — Groq (preferred) or Gemini fallback."""
+"""LLM client — Groq (preferred) with retry, Gemini fallback on rate limits."""
 
+import asyncio
 import logging
 
 import httpx
@@ -9,6 +10,12 @@ from app.config.settings import settings
 logger = logging.getLogger(__name__)
 
 _genai_configured = False
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+_RETRY_DELAYS = (0.0, 1.0, 2.5)
+
+
+class LlmRateLimitError(Exception):
+    """Groq (or primary provider) returned 429 after retries."""
 
 
 def _active_provider() -> str:
@@ -41,23 +48,43 @@ def _history_to_messages(system: str, history: list[dict], user_message: str) ->
 
 async def call_groq(system: str, history: list[dict], user_message: str) -> str:
     messages = _history_to_messages(system, history, user_message)
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.groq_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.groq_model,
-                "messages": messages,
-                "max_tokens": 400,
-                "temperature": 0.2,
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        return (data["choices"][0]["message"]["content"] or "").strip()
+    last_error: Exception | None = None
+
+    for attempt, delay in enumerate(_RETRY_DELAYS):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    GROQ_CHAT_URL,
+                    headers={
+                        "Authorization": f"Bearer {settings.groq_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": settings.groq_model,
+                        "messages": messages,
+                        "max_tokens": 400,
+                        "temperature": 0.2,
+                    },
+                )
+                if response.status_code == 429:
+                    logger.warning("Groq rate limit (attempt %d/%d)", attempt + 1, len(_RETRY_DELAYS))
+                    last_error = LlmRateLimitError(response.text[:200])
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                return (data["choices"][0]["message"]["content"] or "").strip()
+        except LlmRateLimitError as exc:
+            last_error = exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                logger.warning("Groq rate limit (attempt %d/%d)", attempt + 1, len(_RETRY_DELAYS))
+                last_error = LlmRateLimitError(str(exc))
+                continue
+            raise
+
+    raise last_error or LlmRateLimitError("Groq rate limit exceeded")
 
 
 def _call_gemini_sync(system: str, history: list[dict], user_message: str) -> str:
@@ -78,7 +105,8 @@ def _call_gemini_sync(system: str, history: list[dict], user_message: str) -> st
         role = "user" if h.get("role") == "user" else "model"
         parts = h.get("parts", [])
         text = parts[0] if parts else ""
-        gemini_history.append({"role": role, "parts": [text]})
+        if text:
+            gemini_history.append({"role": role, "parts": [text]})
     chat = model.start_chat(history=gemini_history)
     response = chat.send_message(user_message)
     return (response.text or "").strip()
@@ -87,9 +115,13 @@ def _call_gemini_sync(system: str, history: list[dict], user_message: str) -> st
 async def generate_reply(system: str, history: list[dict], user_message: str) -> str:
     provider = _active_provider()
     if provider == "groq":
-        return await call_groq(system, history, user_message)
-    import asyncio
-
+        try:
+            return await call_groq(system, history, user_message)
+        except LlmRateLimitError:
+            if settings.gemini_api_key:
+                logger.warning("Groq rate limited — falling back to Gemini")
+                return await asyncio.to_thread(_call_gemini_sync, system, history, user_message)
+            raise
     return await asyncio.to_thread(_call_gemini_sync, system, history, user_message)
 
 

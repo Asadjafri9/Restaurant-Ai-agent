@@ -2,7 +2,6 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -47,18 +46,10 @@ except ImportError:
 
 
 async def check_whatsapp_token() -> bool:
-    if not settings.whatsapp_access_token:
-        return False
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"https://graph.facebook.com/{settings.whatsapp_api_version}/me",
-                params={"access_token": settings.whatsapp_access_token},
-            )
-            return response.is_success
-    except Exception:
-        logger.exception("WhatsApp token check failed")
-        return False
+    from app.services.whatsapp_service import verify_whatsapp_token
+
+    ok, _ = await verify_whatsapp_token()
+    return ok
 
 
 @asynccontextmanager
@@ -67,20 +58,32 @@ async def lifespan(app: FastAPI):
 
     logging.getLogger().addFilter(RequestIdFilter())
     logger.info("Starting service_mode=%s", settings.service_mode)
-    # Warm DB/Redis pools so first dashboard request is not slow
-    try:
-        if settings.is_admin_service or settings.is_agent_service:
-            await check_central_db()
-        if settings.is_standalone_tenant:
-            from app.db.standalone import check_standalone_db
+    # Warm DB/Redis pools concurrently so the first dashboard request is fast.
+    # Standalone tenant portals also read the central catalog (menu/analytics),
+    # so warm BOTH the tenant pool and the central pool, not just one.
+    warmups = []
+    if settings.database_url_central:
+        warmups.append(check_central_db())
+    if settings.is_standalone_tenant:
+        from app.db.standalone import check_standalone_db
 
-            await check_standalone_db()
-        if settings.redis_url:
-            await check_redis()
+        warmups.append(check_standalone_db())
+    if settings.redis_url:
+        warmups.append(check_redis())
+    try:
+        await asyncio.gather(*warmups, return_exceptions=True)
     except Exception:
         logger.debug("Pool warmup skipped", exc_info=True)
+    if settings.is_agent_service and settings.whatsapp_access_token:
+        from app.services.whatsapp_service import verify_whatsapp_token
+
+        wa_ok, wa_err = await verify_whatsapp_token()
+        if wa_ok:
+            logger.info("WhatsApp access token OK")
+        else:
+            logger.error("WhatsApp access token INVALID: %s", wa_err)
     yield
-    if settings.is_admin_service or settings.is_agent_service:
+    if settings.database_url_central:
         await close_central_db()
     if settings.is_standalone_tenant:
         from app.db.standalone import close_standalone_db
@@ -129,8 +132,12 @@ if settings.is_tenant_service:
 @app.middleware("http")
 async def static_cache_middleware(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path.startswith("/app/"):
-        response.headers["Cache-Control"] = "public, max-age=3600"
+    path = request.url.path
+    if path.startswith("/app/"):
+        if path.endswith((".js", ".css")) and settings.environment == "development":
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        else:
+            response.headers["Cache-Control"] = "public, max-age=3600"
     return response
 
 
@@ -222,8 +229,15 @@ async def health() -> dict:
     else:
         db_ok = False
     redis_ok = await check_redis() if settings.redis_url else False
-    wa_ok = await check_whatsapp_token() if settings.is_agent_service else None
+    wa_ok = None
+    wa_err = None
+    if settings.is_agent_service:
+        from app.services.whatsapp_service import verify_whatsapp_token
+
+        wa_ok, wa_err = await verify_whatsapp_token()
     healthy = db_ok and (redis_ok if settings.redis_url else True)
+    if settings.is_agent_service and wa_ok is False:
+        healthy = False
     out = {
         "status": "healthy" if healthy else "degraded",
         "service_mode": settings.service_mode,
@@ -232,4 +246,6 @@ async def health() -> dict:
     }
     if wa_ok is not None:
         out["whatsapp_token_valid"] = wa_ok
+        if wa_err:
+            out["whatsapp_token_error"] = wa_err
     return out

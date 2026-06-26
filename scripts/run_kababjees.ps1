@@ -15,8 +15,33 @@ Get-Content $envFile | ForEach-Object {
 }
 $env:PYTHONPATH = $root
 $env:TENANT_DATABASE_URL = $env:DATABASE_URL
-Write-Host "[kababjees] migrations..." -ForegroundColor Cyan
+& "$PSScriptRoot\kill_port.ps1" -Port 8003
+& "$PSScriptRoot\kill_port.ps1" -Port 8033
+Write-Host "kababjees migrations..." -ForegroundColor Cyan
 python -m alembic -c migrations/tenant/alembic.ini upgrade head
 python scripts/seed_tenant.py
-Write-Host "[kababjees] http://localhost:8003" -ForegroundColor Green
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8003 --reload --reload-dir app
+
+function Test-PortFree($port) {
+    python -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',$port)); s.close()" 2>$null
+    return $LASTEXITCODE -eq 0
+}
+
+$port = $null
+foreach ($candidate in @(8003, 8033, 8043)) {
+    if (Test-PortFree $candidate) {
+        $port = $candidate
+        break
+    }
+}
+if (-not $port) {
+    Write-Host "Ports 8003/8033/8043 blocked. Reboot PC to clear ghost sockets." -ForegroundColor Red
+    exit 1
+}
+if ($port -ne 8003) {
+    Write-Host "Port 8003 unavailable - Kababjees portal will use $port" -ForegroundColor Yellow
+}
+Write-Host "[kababjees] http://localhost:$port" -ForegroundColor Green
+# Bind IPv6 dual-stack (::) so the browser's IPv6-first resolution of
+# "localhost" (::1) connects instantly instead of stalling ~2s before
+# falling back to IPv4. Dual-stack also accepts IPv4 (127.0.0.1).
+python -m uvicorn app.main:app --host :: --port $port --reload --reload-dir app

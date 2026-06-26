@@ -18,7 +18,7 @@ def _get_engine() -> AsyncEngine:
             raise RuntimeError("DATABASE_URL / TENANT_DATABASE_URL not configured")
         _engine = create_async_engine(
             url,
-            pool_pre_ping=True,
+            pool_pre_ping=settings.db_pool_pre_ping,
             pool_size=10,
             max_overflow=10,
             pool_recycle=300,

@@ -17,7 +17,7 @@ from app.core.security import (
 from app.db.central import get_central_session
 from app.db.models_central import Tenant, User
 from app.db.models_tenant import StaffUser
-from app.db.redis_client import get_redis
+from app.db.redis_client import get_redis, reset_redis
 from app.db.standalone import get_standalone_session
 from app.core.logging import request_id_var
 from app.deps.auth import CurrentUser, get_current_user
@@ -95,25 +95,48 @@ async def _store_refresh(portal: str, jti: str, user_id: uuid.UUID) -> None:
         r = get_redis()
         await r.setex(f"refresh:{portal}:{jti}", 7 * 86400, str(user_id))
     except Exception:
-        logger.exception("Failed to store refresh token in Redis (portal=%s)", portal)
-        raise HTTPException(
-            status_code=503,
-            detail="Authentication service unavailable",
-        ) from None
+        reset_redis()
+        logger.warning(
+            "Failed to store refresh token in Redis (portal=%s)",
+            portal,
+            exc_info=True,
+        )
+        if not settings.is_dev:
+            raise HTTPException(
+                status_code=503,
+                detail="Authentication service unavailable",
+            ) from None
 
 
 async def _revoke_refresh(portal: str, jti: str) -> None:
     if not settings.redis_url:
         return
-    r = get_redis()
-    await r.delete(f"refresh:{portal}:{jti}")
+    try:
+        r = get_redis()
+        await r.delete(f"refresh:{portal}:{jti}")
+    except Exception:
+        reset_redis()
+        logger.warning(
+            "Failed to revoke refresh token in Redis (portal=%s)",
+            portal,
+            exc_info=True,
+        )
 
 
 async def _verify_refresh_stored(portal: str, jti: str) -> bool:
     if not settings.redis_url:
         return True
-    r = get_redis()
-    return bool(await r.get(f"refresh:{portal}:{jti}"))
+    try:
+        r = get_redis()
+        return bool(await r.get(f"refresh:{portal}:{jti}"))
+    except Exception:
+        reset_redis()
+        logger.warning(
+            "Failed to verify refresh token in Redis (portal=%s)",
+            portal,
+            exc_info=True,
+        )
+        return settings.is_dev
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -144,8 +167,8 @@ async def login(body: LoginRequest, response: Response) -> TokenResponse:
             refresh = create_refresh_token(
                 user_id=staff.id, jti=jti, tenant_id=tenant_id, portal=portal
             )
-            await _store_refresh(portal, jti, staff.id)
             _set_refresh_cookie(response, portal, refresh)
+            await _store_refresh(portal, jti, staff.id)
             return TokenResponse(access_token=access, role=staff.role, tenant_slug=tenant_slug)
 
     try:

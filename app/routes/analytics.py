@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select, text
 
@@ -7,6 +8,28 @@ from app.deps.auth import TenantContext, get_tenant_ctx, require_role
 from fastapi import APIRouter, Depends, Query
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+BUSINESS_TZ = ZoneInfo("Asia/Karachi")
+
+
+def resolve_date_range(
+    range_key: str | None,
+    date_from: datetime | None,
+    date_to: datetime | None,
+) -> tuple[datetime | None, datetime | None, str]:
+    """Resolve preset range keys to timezone-aware [from, to) bounds in business TZ."""
+    if not range_key:
+        return date_from, date_to, "day"
+    now = datetime.now(BUSINESS_TZ)
+    start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if range_key == "today":
+        end = start_of_today + timedelta(days=1)
+        return start_of_today, end, "hour"
+    if range_key == "7d":
+        return start_of_today - timedelta(days=6), start_of_today + timedelta(days=1), "day"
+    if range_key == "30d":
+        return start_of_today - timedelta(days=29), start_of_today + timedelta(days=1), "day"
+    return date_from, date_to, "day"
 
 
 async def _summary(ctx: TenantContext, date_from: datetime | None, date_to: datetime | None) -> dict:
@@ -41,8 +64,9 @@ async def _revenue_timeseries(
     granularity: str = "day",
 ) -> list[dict]:
     trunc = {"hour": "hour", "day": "day", "week": "week", "month": "month"}.get(granularity, "day")
+    tz_name = "Asia/Karachi"
     sql = text(f"""
-        SELECT date_trunc(:trunc, placed_at) AS bucket,
+        SELECT date_trunc(:trunc, placed_at AT TIME ZONE :tz) AS bucket,
                count(*) AS orders,
                coalesce(sum(total), 0) AS revenue,
                coalesce(avg(total), 0) AS aov
@@ -52,7 +76,7 @@ async def _revenue_timeseries(
         {"AND placed_at < :date_to" if date_to else ""}
         GROUP BY 1 ORDER BY 1
     """)
-    params: dict = {"trunc": trunc}
+    params: dict = {"trunc": trunc, "tz": tz_name}
     if date_from:
         params["date_from"] = date_from
     if date_to:
@@ -107,14 +131,28 @@ async def _orders_by_status(
     return [{"status": r[0], "count": r[1]} for r in rows]
 
 
-async def _peak_hours(ctx: TenantContext) -> list[dict]:
-    sql = text("""
-        SELECT extract(hour from placed_at)::int AS hour, count(*) AS count
+async def _peak_hours(
+    ctx: TenantContext,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> list[dict]:
+    clauses = ["status != 'cancelled'"]
+    params: dict = {}
+    if date_from:
+        clauses.append("placed_at >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        clauses.append("placed_at < :date_to")
+        params["date_to"] = date_to
+    tz_name = "Asia/Karachi"
+    sql = text(f"""
+        SELECT extract(hour from (placed_at AT TIME ZONE :tz))::int AS hour, count(*) AS count
         FROM orders
-        WHERE status != 'cancelled'
+        WHERE {" AND ".join(clauses)}
         GROUP BY 1 ORDER BY 1
     """)
-    rows = (await ctx.session.execute(sql)).all()
+    params["tz"] = tz_name
+    rows = (await ctx.session.execute(sql, params)).all()
     return [{"hour": int(r.hour), "count": int(r.count)} for r in rows]
 
 
@@ -167,11 +205,12 @@ async def peak_hours(
     ctx: TenantContext = Depends(get_tenant_ctx),
     _: object = Depends(require_role("owner", "manager")),
 ) -> list[dict]:
-    return await _peak_hours(ctx)
+    return await _peak_hours(ctx, date_from, date_to)
 
 
 @router.get("/dashboard")
 async def analytics_dashboard(
+    range_key: str | None = Query(None, alias="range"),
     date_from: datetime | None = Query(None, alias="from"),
     date_to: datetime | None = Query(None, alias="to"),
     ctx: TenantContext = Depends(get_tenant_ctx),
@@ -182,9 +221,12 @@ async def analytics_dashboard(
 
     from app.core.read_cache import cache_key, cached_json
 
+    date_from, date_to, granularity = resolve_date_range(range_key, date_from, date_to)
+
     key = cache_key(
         "analytics",
         str(ctx.tenant_id),
+        range_key or "",
         date_from.isoformat() if date_from else "",
         date_to.isoformat() if date_to else "",
     )
@@ -192,10 +234,10 @@ async def analytics_dashboard(
     async def load() -> dict:
         summary, ts, top, by_status, hours = await asyncio.gather(
             _summary(ctx, date_from, date_to),
-            _revenue_timeseries(ctx, date_from, date_to),
+            _revenue_timeseries(ctx, date_from, date_to, granularity),
             _top_items(ctx, date_from, date_to),
             _orders_by_status(ctx, date_from, date_to),
-            _peak_hours(ctx),
+            _peak_hours(ctx, date_from, date_to),
         )
         return {
             "summary": summary,
@@ -203,6 +245,10 @@ async def analytics_dashboard(
             "top_items": top,
             "orders_by_status": by_status,
             "peak_hours": hours,
+            "range": range_key,
+            "date_from": date_from.isoformat() if date_from else None,
+            "date_to": date_to.isoformat() if date_to else None,
         }
 
-    return await cached_json(key, 20, load)
+    ttl = 5 if range_key == "today" else 20
+    return await cached_json(key, ttl, load)

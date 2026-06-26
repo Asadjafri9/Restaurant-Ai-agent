@@ -32,6 +32,9 @@ async def sync_tenant_menu_to_central(tenant_id: uuid.UUID) -> int:
 
     Returns the number of items synced. Removes stale central rows that no
     longer exist in the tenant database.
+
+    Skipped when central catalog is the source of truth (shared Postgres) —
+    syncing would copy every restaurant's menu_items into one tenant's catalog.
     """
     from app.config.settings import get_settings
 
@@ -39,6 +42,12 @@ async def sync_tenant_menu_to_central(tenant_id: uuid.UUID) -> int:
 
     if not settings.database_url_central:
         logger.warning("Cannot sync menu for %s: DATABASE_URL_CENTRAL not set", tenant_id)
+        return 0
+
+    # Agent service and shared-db setups use catalog_items (per tenant_id) as the
+    # only menu source. Mirroring menu_items would copy all restaurants into one tenant.
+    if settings.database_url_central and not settings.is_standalone_tenant:
+        logger.debug("Skipping menu sync for %s — central catalog is source of truth", tenant_id)
         return 0
 
     session = await _tenant_menu_session(tenant_id)

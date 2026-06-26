@@ -15,7 +15,7 @@ def _get_engine():
             raise RuntimeError("DATABASE_URL_CENTRAL not configured")
         _engine = create_async_engine(
             settings.async_database_url_central,
-            pool_pre_ping=True,
+            pool_pre_ping=settings.db_pool_pre_ping,
             pool_size=10,
             max_overflow=10,
             pool_recycle=300,

@@ -25,8 +25,12 @@ $keys = @(
     "WHATSAPP_APP_SECRET",
     "GROQ_API_KEY",
     "GROQ_MODEL",
+    "GROQ_WHISPER_MODEL",
     "AI_PROVIDER",
-    "GEMINI_API_KEY"
+    "GEMINI_API_KEY",
+    "ELEVENLABS_API_KEY",
+    "ELEVENLABS_VOICE_ID",
+    "ELEVENLABS_MODEL_ID"
 )
 
 $toSet = @()
@@ -49,6 +53,13 @@ Write-Host "Setting on Railway ($service):" -ForegroundColor Cyan
 foreach ($pair in $toSet) {
     $name = ($pair -split '=', 2)[0]
     Write-Host "  $name"
+}
+
+Write-Host "Verifying WhatsApp token..." -ForegroundColor Cyan
+& (Join-Path $PSScriptRoot "check_whatsapp_token.ps1")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Aborting sync — fix WHATSAPP_ACCESS_TOKEN in .env first." -ForegroundColor Red
+    exit 1
 }
 
 railway variables set @toSet --service $service

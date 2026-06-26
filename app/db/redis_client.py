@@ -38,6 +38,12 @@ async def close_redis() -> None:
         _client = None
 
 
+def reset_redis() -> None:
+    """Drop the cached client so the next call opens a fresh connection."""
+    global _client
+    _client = None
+
+
 async def redis_set_json(key: str, value: dict[str, Any], ttl_seconds: int | None = None) -> None:
     import json
 

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 ORDER_STATUSES = {
     "placed": ["accepted", "cancelled"],
-    "accepted": ["preparing", "cancelled"],
+    "accepted": ["preparing", "out_for_delivery", "cancelled"],
     "preparing": ["out_for_delivery", "cancelled"],
     "out_for_delivery": ["delivered", "cancelled"],
     "delivered": [],

@@ -21,11 +21,19 @@ class Settings(BaseSettings):
     ai_provider: str = "auto"  # auto | groq | gemini
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
+    groq_whisper_model: str = "whisper-large-v3"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash-lite"
     ai_fallback_message: str = (
         "Sorry, I am unable to respond right now.\nPlease try again later."
     )
+
+    # Voice replies (ElevenLabs TTS when customer sends a voice note)
+    elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = "pFZP5JQG7iQjIQuC4Bku"  # Lily — premade, works on free API tier
+    elevenlabs_model_id: str = "eleven_turbo_v2_5"
+    elevenlabs_stability: float = 0.5
+    elevenlabs_similarity_boost: float = 0.75
 
     # Infrastructure
     database_url_central: str = ""
@@ -57,6 +65,11 @@ class Settings(BaseSettings):
 
     environment: str = "development"
     webhook_signature_required: bool = True
+
+    # When the DB/Redis live behind a high-latency proxy (local dev against
+    # remote Railway), pre-ping adds a full extra round trip before every query.
+    # Empty = auto (off in development, on in production).
+    db_pool_pre_ping_override: bool | None = None
 
     @field_validator("gemini_api_key", mode="before")
     @classmethod
@@ -113,6 +126,24 @@ class Settings(BaseSettings):
 
             self.tenant_id = str(TENANT_IDS[self.service_mode])
         return self
+
+    @property
+    def is_dev(self) -> bool:
+        return self.environment == "development"
+
+    @property
+    def db_pool_pre_ping(self) -> bool:
+        if self.db_pool_pre_ping_override is not None:
+            return self.db_pool_pre_ping_override
+        # Off in dev (remote proxy: pre-ping = extra round trip), on in prod
+        # where the DB is on the same private network and connections drop.
+        return not self.is_dev
+
+    @property
+    def use_read_cache(self) -> bool:
+        """In dev against a remote Redis, the read-cache adds round trips on
+        miss without a real hit-rate benefit, so bypass it locally."""
+        return bool(self.redis_url) and not self.is_dev
 
     @property
     def is_agent_service(self) -> bool:

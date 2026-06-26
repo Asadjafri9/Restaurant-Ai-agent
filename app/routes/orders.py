@@ -1,9 +1,7 @@
 import uuid
-from datetime import datetime
 
 from pydantic import BaseModel
 from sqlalchemy import func, select
-from sqlalchemy.orm import selectinload
 
 from app.db.models_tenant import Customer, Order, OrderItem
 from app.deps.auth import TenantContext, get_tenant_ctx, require_role
@@ -21,6 +19,7 @@ class StatusUpdate(BaseModel):
 
 
 ACTIVE_STATUSES = ("placed", "accepted", "preparing", "out_for_delivery")
+BOARD_STATUSES = ACTIVE_STATUSES + ("delivered",)
 
 
 @router.get("")
@@ -52,43 +51,54 @@ async def order_board(
     ctx: TenantContext = Depends(get_tenant_ctx),
     _: object = Depends(require_role("owner", "manager", "staff")),
 ) -> list[dict]:
-    from app.core.read_cache import cache_key, cached_json
-
-    key = cache_key("board", str(ctx.tenant_id))
-
-    async def load() -> list[dict]:
-        item_count_sq = (
-            select(func.count(OrderItem.id))
-            .where(OrderItem.order_id == Order.id)
-            .correlate(Order)
-            .scalar_subquery()
+    item_count_sq = (
+        select(func.count(OrderItem.id))
+        .where(OrderItem.order_id == Order.id)
+        .correlate(Order)
+        .scalar_subquery()
+    )
+    result = await ctx.session.execute(
+        select(
+            Order.id,
+            Order.status,
+            Order.total,
+            Order.placed_at,
+            Order.delivery_address,
+            Customer.name.label("customer_name"),
+            item_count_sq.label("item_count"),
         )
-        result = await ctx.session.execute(
-            select(
-                Order.id,
-                Order.status,
-                Order.total,
-                Order.placed_at,
-                Order.delivery_address,
-                item_count_sq.label("item_count"),
+        .join(Customer, Customer.id == Order.customer_id)
+        .where(Order.status.in_(BOARD_STATUSES))
+        .order_by(Order.placed_at.desc())
+        .limit(100)
+    )
+    rows = result.all()
+    order_ids = [r.id for r in rows]
+    items_by_order: dict[uuid.UUID, list[dict]] = {}
+    if order_ids:
+        items_result = await ctx.session.execute(
+            select(OrderItem).where(OrderItem.order_id.in_(order_ids))
+        )
+        for item in items_result.scalars():
+            items_by_order.setdefault(item.order_id, []).append(
+                {
+                    "name": item.item_name_snapshot,
+                    "quantity": item.quantity,
+                }
             )
-            .where(Order.status.in_(ACTIVE_STATUSES))
-            .order_by(Order.placed_at.desc())
-            .limit(100)
-        )
-        return [
-            {
-                "id": str(r.id),
-                "status": r.status,
-                "total": float(r.total),
-                "placed_at": r.placed_at.isoformat(),
-                "item_count": int(r.item_count or 0),
-                "delivery_address": r.delivery_address,
-            }
-            for r in result.all()
-        ]
-
-    return await cached_json(key, 5, load)
+    return [
+        {
+            "id": str(r.id),
+            "status": r.status,
+            "total": float(r.total),
+            "placed_at": r.placed_at.isoformat(),
+            "item_count": int(r.item_count or 0),
+            "delivery_address": r.delivery_address,
+            "customer_name": r.customer_name or "",
+            "items": items_by_order.get(r.id, []),
+        }
+        for r in rows
+    ]
 
 
 @router.get("/{order_id}")

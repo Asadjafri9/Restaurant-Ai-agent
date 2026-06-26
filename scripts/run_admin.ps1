@@ -12,4 +12,7 @@ Write-Host "[admin] migrations..." -ForegroundColor Cyan
 python -m alembic -c migrations/central/alembic.ini upgrade head
 python scripts/seed_admin.py
 Write-Host "[admin] http://localhost:8001" -ForegroundColor Green
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload --reload-dir app
+# Bind IPv6 dual-stack (::) so the browser's IPv6-first resolution of
+# "localhost" (::1) connects instantly instead of stalling ~2s before
+# falling back to IPv4. Dual-stack also accepts IPv4 (127.0.0.1).
+python -m uvicorn app.main:app --host :: --port 8001 --reload --reload-dir app

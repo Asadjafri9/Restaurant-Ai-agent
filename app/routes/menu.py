@@ -4,11 +4,17 @@ from decimal import Decimal
 from pydantic import BaseModel
 from sqlalchemy import select
 
+from app.config.settings import settings
 from app.db.models_tenant import MenuCategory, MenuItem, MenuOutbox
 from app.deps.auth import TenantContext, get_tenant_ctx, require_role
 from fastapi import APIRouter, Depends, HTTPException
 
 router = APIRouter(prefix="/menu", tags=["menu"])
+
+
+def _uses_central_menu() -> bool:
+    """Standalone portals store menus in central catalog when tenant DB may be shared."""
+    return settings.is_standalone_tenant and bool(settings.database_url_central)
 
 
 class CategoryCreate(BaseModel):
@@ -62,6 +68,10 @@ async def list_items(ctx: TenantContext = Depends(get_tenant_ctx)) -> list[dict]
     key = cache_key("menu", str(ctx.tenant_id))
 
     async def load() -> list[dict]:
+        if _uses_central_menu():
+            from app.services.catalog_portal import list_catalog_items
+
+            return await list_catalog_items(ctx.tenant_id)
         result = await ctx.session.execute(
             select(MenuItem).where(MenuItem.deleted_at.is_(None)).order_by(MenuItem.sort_order)
         )
@@ -104,6 +114,21 @@ async def create_item(
     ctx: TenantContext = Depends(get_tenant_ctx),
     _: object = Depends(require_role("owner", "manager")),
 ) -> dict:
+    if _uses_central_menu():
+        from app.core.read_cache import invalidate_prefix
+        from app.services.catalog_portal import create_catalog_item
+
+        result = await create_catalog_item(
+            ctx.tenant_id,
+            name=body.name,
+            description=body.description,
+            price=body.price,
+            is_available=body.is_available,
+            sort_order=body.sort_order,
+        )
+        await invalidate_prefix(f"api:menu:{ctx.tenant_id}")
+        return result
+
     item = MenuItem(
         name=body.name,
         description=body.description,
@@ -133,6 +158,25 @@ async def update_item(
     ctx: TenantContext = Depends(get_tenant_ctx),
     _: object = Depends(require_role("owner", "manager")),
 ) -> dict:
+    if _uses_central_menu():
+        from app.core.read_cache import invalidate_prefix
+        from app.services.catalog_portal import update_catalog_item
+
+        try:
+            result = await update_catalog_item(
+                ctx.tenant_id,
+                item_id,
+                name=body.name,
+                description=body.description,
+                price=body.price,
+                is_available=body.is_available,
+                sort_order=body.sort_order,
+            )
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Item not found") from None
+        await invalidate_prefix(f"api:menu:{ctx.tenant_id}")
+        return result
+
     item = await ctx.session.get(MenuItem, item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -166,6 +210,17 @@ async def delete_item(
     ctx: TenantContext = Depends(get_tenant_ctx),
     _: object = Depends(require_role("owner", "manager")),
 ) -> dict:
+    if _uses_central_menu():
+        from app.core.read_cache import invalidate_prefix
+        from app.services.catalog_portal import delete_catalog_item
+
+        try:
+            await delete_catalog_item(ctx.tenant_id, item_id)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Item not found") from None
+        await invalidate_prefix(f"api:menu:{ctx.tenant_id}")
+        return {"status": "deleted"}
+
     item = await ctx.session.get(MenuItem, item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
