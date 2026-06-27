@@ -21,9 +21,9 @@ class Settings(BaseSettings):
     ai_provider: str = "auto"  # auto | groq | gemini
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
-    groq_whisper_model: str = "whisper-large-v3"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash-lite"
+    gemini_stt_model: str = "gemini-2.5-flash"  # speech-to-text (multimodal audio input)
     ai_fallback_message: str = (
         "Sorry, I am unable to respond right now.\nPlease try again later."
     )
