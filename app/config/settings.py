@@ -17,12 +17,12 @@ class Settings(BaseSettings):
     whatsapp_app_secret: str = ""
     whatsapp_api_version: str = "v25.0"
 
-    # AI (Groq preferred when GROQ_API_KEY is set)
-    ai_provider: str = "auto"  # auto | groq | gemini
+    # AI (Gemini preferred when GEMINI_API_KEY is set, Groq as fallback)
+    ai_provider: str = "auto"  # auto | gemini | groq
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash-lite"
+    gemini_model: str = "gemini-2.5-flash"
     gemini_stt_model: str = "gemini-2.5-flash"  # speech-to-text (multimodal audio input)
     ai_fallback_message: str = (
         "Sorry, I am unable to respond right now.\nPlease try again later."

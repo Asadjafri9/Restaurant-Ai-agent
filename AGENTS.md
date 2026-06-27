@@ -52,7 +52,7 @@ Webhook → `app/routes/webhook.py` → `app/services/agent/runner.py` OR `app/s
 
 `app/services/order_agent.py:788` is the early-confirm path — when customer says YES, it persists directly from `session.pending_items` without round-tripping the LLM. Don't refactor this without reading the test (`tests/test_order_confirm.py`).
 
-LLM provider order: Groq first (Llama 3.3 70B + Whisper Large), Gemini as fallback on 429. See `app/services/llm_client.py:115-125`. Voice reply uses ElevenLabs only if `ELEVENLABS_API_KEY` is set; text reply is always sent first.
+LLM provider order: Gemini 2.5 Flash (new google.genai SDK) first, Groq (Llama 3.3 70B) as fallback on rate limit. Speech-to-text: Gemini 2.5 Flash (multimodal audio), Groq Whisper as fallback. See `app/services/llm_client.py:generate_reply` and `app/services/speech_service.py:transcribe`. Voice reply uses ElevenLabs only if `ELEVENLABS_API_KEY` is set; text reply is always sent first.
 
 ## Commands
 

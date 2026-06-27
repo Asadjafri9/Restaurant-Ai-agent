@@ -139,7 +139,7 @@ async def ensure_latin_transcript(text: str) -> str:
         return text
 
     # Mixed Urdu/Latin voice — Latin tokens (kfc, block c5, cola) still parse correctly.
-    # Avoid a second Groq chat call per voice note; order_context handles the rest.
+    # Avoid a second LLM chat call per voice note; order_context handles the rest.
     logger.info("Mixed-script voice kept as-is after normalize (%d chars)", len(text))
     return text
 
