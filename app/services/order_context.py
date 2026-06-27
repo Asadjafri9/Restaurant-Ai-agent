@@ -193,9 +193,46 @@ def _title_name(name: str) -> str:
     return cleaned.title()
 
 
+_PURE_DECLINE_OR_ACK = frozenset(
+    {
+        "no", "n", "nope", "nah", "nahi", "na", "bas", "bus",
+        "done", "ok", "okay", "kk", "k", "y", "yes", "yep", "yeah",
+        "ji", "jee", "han", "haan", "hann",
+        "theek", "theek hai", "bilkul", "sahi", "agreed", "correct",
+        "cancel", "abort", "stop",
+        "no thanks", "nahi thanks", "thanks", "thank you", "shukriya",
+    }
+)
+
+
+_SET_QTY_PATTERNS = (
+    r"\bmake\s+it\s+\d+",
+    r"\bset\s+it\s+to\s+\d+",
+    r"\bchange\s+it\s+to\s+\d+",
+    r"\bupdate\s+it\s+to\s+\d+",
+    r"\b(is\s+ko|yeh|ye|wo|this|it)\s+\d+",
+    r"\b\d+\s+(kardo|kar\s*do|karo|karna|de|dena|dedo)",
+    r"\b(ek|one)\s+(aur|more|another)\b",
+    r"\b(do|two|teen|three|char|four|paanch|panch|five)\s+(aur|more|additional)\b",
+    r"\b\d+\s+(aur|more|additional)\b",
+)
+
+
+def _is_set_qty_text(text: str) -> bool:
+    """True when the message matches a set-qty / increment intent pattern."""
+    if not text:
+        return False
+    lower = text.lower()
+    return any(re.search(p, lower) for p in _SET_QTY_PATTERNS)
+
+
 def extract_customer_name(text: str) -> str | None:
     """Explicit name phrases win over single-word guesses."""
     if is_thank_you_message(text):
+        return None
+    if is_done_adding_items(text):
+        return None
+    if _is_set_qty_text(text):
         return None
     text = fix_name_transcript(text)
     for pattern in NAME_PATTERNS:
@@ -203,14 +240,27 @@ def extract_customer_name(text: str) -> str | None:
         if match:
             return _title_name(match.group(1))
     normalized = normalize_user_text(text)
+    if not normalized:
+        return None
+    if normalized in _PURE_DECLINE_OR_ACK:
+        return None
+    # A name reply rarely has digits — if the message carries a number, it is
+    # almost certainly an order intent, not a name.
+    if any(ch.isdigit() for ch in normalized):
+        return None
     words = [w for w in normalized.split() if w not in ("bhai", "ji", "jani")]
     if not words or len(words) > 3:
         return None
-    if any(w in normalized for w in _ORDER_WORDS):
+    if any(re.search(rf"\b{re.escape(w)}\b", normalized) for w in _ORDER_WORDS):
         return None
-    if any(m in normalized for m in ADDRESS_MARKERS):
+    if any(re.search(rf"\b{re.escape(m)}\b", normalized) for m in ADDRESS_MARKERS):
         return None
-    return _title_name(words[0].upper() if len(words[0]) <= 3 else words[0].capitalize())
+    first = words[0]
+    # Don't extract a decline/ack word as a name even if it has trailing words
+    # (e.g. "no onions", "no, biryani hatao", "thanks bhai")
+    if first in _PURE_DECLINE_OR_ACK:
+        return None
+    return _title_name(first.upper() if len(first) <= 3 else first.capitalize())
 
 
 def _clean_address(addr: str) -> str:
@@ -541,10 +591,15 @@ _QTY_PATTERNS = (
 )
 
 
-def detect_set_qty_intent(text: str, catalog: list[dict]) -> tuple[str, int] | None:
+def detect_set_qty_intent(
+    text: str, catalog: list[dict], session=None
+) -> tuple[str, int] | None:
     """Return (item_name, new_quantity) for a 'make that N' or 'N items' style intent.
 
     Conservative: only fires when the customer references a number AND a known menu item.
+    When session is passed and no item is named, falls back to the last cart item
+    (handles 'make it 2', 'ek aur', 'one more', 'N aur', 'N more').
+
     Returns None otherwise.
     """
     from app.services.voice_text import normalize_user_text
@@ -553,15 +608,13 @@ def detect_set_qty_intent(text: str, catalog: list[dict]) -> tuple[str, int] | N
         return None
     lower = text.lower()
     nums = re.findall(r"\b\d+\b", lower)
-    if not nums:
-        return None
-    qty = max(1, int(nums[0]))
+    qty_digit = max(1, int(nums[0])) if nums else None
     for item in catalog:
         name = (item.get("name") or "").strip()
         if not name:
             continue
-        if name.lower() in lower:
-            return name, qty
+        if name.lower() in lower and qty_digit is not None:
+            return name, qty_digit
     sorted_catalog = sorted(catalog, key=lambda c: len(c.get("name", "")), reverse=True)
     for item in sorted_catalog:
         name = (item.get("name") or "").strip().lower()
@@ -570,15 +623,14 @@ def detect_set_qty_intent(text: str, catalog: list[dict]) -> tuple[str, int] | N
         for token in name.split():
             if len(token) < 4:
                 continue
-            if re.search(rf"\b\d+\b[^\d]{{0,8}}\b{re.escape(token)}\b", lower) or re.search(
-                rf"\b{re.escape(token)}\b[^\d]{{0,8}}\b\d+\b", lower
+            if qty_digit is not None and (
+                re.search(rf"\b{qty_digit}\b[^\d]{{0,8}}\b{re.escape(token)}\b", lower)
+                or re.search(rf"\b{re.escape(token)}\b[^\d]{{0,8}}\b{qty_digit}\b", lower)
             ):
-                return item["name"], qty
+                return item["name"], qty_digit
     cleaned = normalize_user_text(text)
     nums2 = re.findall(r"\b\d+\b", cleaned)
-    if not nums2:
-        return None
-    qty = max(1, int(nums2[0]))
+    qty_digit2 = max(1, int(nums2[0])) if nums2 else qty_digit
     for item in sorted_catalog:
         name = (item.get("name") or "").strip().lower()
         if not name:
@@ -587,7 +639,44 @@ def detect_set_qty_intent(text: str, catalog: list[dict]) -> tuple[str, int] | N
             if len(token) < 4:
                 continue
             if token in cleaned:
-                return item["name"], qty
+                return item["name"], qty_digit2 or 1
+    if session and getattr(session, "pending_items", None) and qty_digit is not None:
+        last = session.pending_items[-1]
+        last_name = last.get("item")
+        last_qty = int(last.get("quantity", 1))
+        if not last_name:
+            return None
+        set_cues = (
+            r"\bmake\s+it\s+(\d+)\b",
+            r"\bset\s+it\s+to\s+(\d+)\b",
+            r"\bchange\s+it\s+to\s+(\d+)\b",
+            r"\bupdate\s+it\s+to\s+(\d+)\b",
+            r"\b(is\s+ko|yeh|ye|wo|this|it)\s+(\d+)\b",
+            r"\b(\d+)\s+(kardo|kar\s*do|karo|karna|de|dena|dedo)\b",
+        )
+        for pat in set_cues:
+            m = re.search(pat, lower)
+            if m:
+                nums_in = re.findall(r"\d+", m.group(0))
+                if nums_in:
+                    return last_name, max(1, int(nums_in[0]))
+        if re.search(r"\b(\d+)\s+(aur|more|additional)\b", lower):
+            m = re.search(r"\b(\d+)\s+(aur|more|additional)\b", lower)
+            return last_name, last_qty + int(m.group(1))
+    if session and getattr(session, "pending_items", None):
+        last = session.pending_items[-1]
+        last_name = last.get("item")
+        last_qty = int(last.get("quantity", 1))
+        if not last_name:
+            return None
+        if re.search(r"\b(ek|one)\s+(aur|more|another)\b", lower):
+            return last_name, last_qty + 1
+        word_to_n = {"do": 2, "two": 2, "teen": 3, "three": 3, "char": 4, "four": 4, "paanch": 5, "panch": 5, "five": 5}
+        m = re.search(r"\b(do|two|teen|three|char|four|paanch|panch|five)\s+(aur|more|additional)\b", lower)
+        if m:
+            return last_name, last_qty + word_to_n.get(m.group(1), 1)
+        if re.search(r"\b(aur|more|another)\b", lower) and not re.search(r"\b\d+\b", lower):
+            return last_name, last_qty + 1
     return None
 
 

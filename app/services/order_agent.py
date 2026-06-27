@@ -888,6 +888,7 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
 
     edit_applied = False
     edit_summary: str | None = None
+    edit_kind: str | None = None
     has_modifier_with_item = False
     if (
         session.active_tenant_slug
@@ -904,12 +905,14 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
         ):
             apply_pending_edit(session, remove=remove_name)
             edit_applied = True
+            edit_kind = "remove"
             edit_summary = f"removed {remove_name}"
         else:
-            set_qty = detect_set_qty_intent(user_message, catalog_items)
+            set_qty = detect_set_qty_intent(user_message, catalog_items, session)
             if set_qty:
                 apply_pending_edit(session, set_qty=set_qty)
                 edit_applied = True
+                edit_kind = "set_qty"
                 edit_summary = f"set {set_qty[0]} to {set_qty[1]}"
         if has_modifier_cue(user_message) and message_mentions_items(
             user_message, catalog_items
@@ -917,6 +920,27 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
             has_modifier_with_item = True
 
     skip_items_added_reply = edit_applied or has_modifier_with_item
+
+    if edit_applied and edit_kind in ("remove", "set_qty"):
+        items_text = format_pending_items_list(session.pending_items)
+        if not items_text:
+            customer_reply = msg("menu_ask", session.language)
+        else:
+            customer_reply = msg("order_updated", session.language, items=items_text)
+        session.state = "ordering"
+        session.awaiting_confirm = False
+        session.history = [
+            {"role": "user", "parts": [user_message]},
+            {"role": "model", "parts": [customer_reply[:2000]]},
+        ] + session.history[-16:]
+        await save_session_async(session)
+        logger.info(
+            "Deterministic edit reply (%s) for %s in %.2fs",
+            edit_kind,
+            phone[:6] + "***",
+            time.perf_counter() - t0,
+        )
+        return customer_reply
 
     if _is_show_order_request(user_message) and session.active_tenant_slug and not is_yes:
         if not catalog_items:

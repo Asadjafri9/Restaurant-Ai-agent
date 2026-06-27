@@ -152,6 +152,83 @@ def test_has_remove_cue_thank_you_false():
     assert not has_remove_cue("shukriya")
 
 
+def test_extract_customer_name_decline_word_not_name():
+    from app.services.order_context import extract_customer_name
+
+    assert extract_customer_name("no") is None
+    assert extract_customer_name("nahi") is None
+    assert extract_customer_name("bas") is None
+    assert extract_customer_name("nope") is None
+    assert extract_customer_name("ok") is None
+    assert extract_customer_name("done") is None
+
+
+def test_extract_customer_name_no_onions_not_no():
+    from app.services.order_context import extract_customer_name
+
+    assert extract_customer_name("no onions") is None
+    assert extract_customer_name("no, biryani hatao") is None
+    assert extract_customer_name("thanks bhai") is None
+    assert extract_customer_name("shukriya") is None
+
+
+def test_extract_customer_name_make_it_2_not_make():
+    from app.services.order_context import extract_customer_name
+
+    assert extract_customer_name("Make it 2") is None
+    assert extract_customer_name("set it to 3") is None
+    assert extract_customer_name("5 kardo") is None
+    assert extract_customer_name("ek aur") is None
+
+
+def test_extract_customer_name_real_name_still_works():
+    from app.services.order_context import extract_customer_name
+
+    assert extract_customer_name("Ali") == "Ali"
+    assert extract_customer_name("Ali Khan") == "Ali"
+    assert extract_customer_name("mera naam Ali hai") == "Ali"
+
+
+def test_extract_customer_name_khan_not_filtered_by_han():
+    """Substring match bug: 'han' was matching 'khan' in 'Ali Khan'."""
+    from app.services.order_context import extract_customer_name
+
+    assert extract_customer_name("Khan") == "Khan"
+
+
+def test_detect_set_qty_make_it_n_implicit_last_item():
+    from app.services.order_context import detect_set_qty_intent
+
+    s = CustomerSession(
+        phone="+923001234567",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+    )
+    assert detect_set_qty_intent("Make it 2", CATALOG, s) == ("Krusher", 2)
+    assert detect_set_qty_intent("set it to 3", CATALOG, s) == ("Krusher", 3)
+    assert detect_set_qty_intent("is ko 2", CATALOG, s) == ("Krusher", 2)
+    assert detect_set_qty_intent("5 kardo", CATALOG, s) == ("Krusher", 5)
+
+
+def test_detect_set_qty_ek_aur_increments_last_item():
+    from app.services.order_context import detect_set_qty_intent
+
+    s = CustomerSession(
+        phone="+923001234567",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+    )
+    assert detect_set_qty_intent("ek aur", CATALOG, s) == ("Krusher", 2)
+    assert detect_set_qty_intent("one more", CATALOG, s) == ("Krusher", 2)
+    assert detect_set_qty_intent("do aur", CATALOG, s) == ("Krusher", 3)
+    assert detect_set_qty_intent("3 aur", CATALOG, s) == ("Krusher", 4)
+
+
+def test_detect_set_qty_no_session_does_not_use_implicit():
+    from app.services.order_context import detect_set_qty_intent
+
+    assert detect_set_qty_intent("Make it 2", CATALOG) is None
+    assert detect_set_qty_intent("ek aur", CATALOG) is None
+
+
 def test_is_show_order_request_english():
     from app.services.order_agent import _is_show_order_request
 
