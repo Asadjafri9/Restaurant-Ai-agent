@@ -330,3 +330,64 @@ def resolve_restaurant_slug(text: str, restaurants: list[dict]) -> str | None:
         if "kfc" in candidate or "kentucky" in candidate:
             return "kfc"
     return None
+
+
+QUESTION_STARTS = (
+    "how", "what", "which", "why", "when", "where", "do you",
+    "can you", "is it", "are ", "could you", "kya", "kab",
+    "kahan", "kahaan", "kaun", "kon", "kitna", "kitne", "kaisa",
+    "kaisi", "kaisay", "kab tak", "kab aayega", "kab aayegi",
+    "kitne ka", "kitna hai", "kya hai", "kya milega", "kya hai aap",
+    "kya aata", "available", "deliver", "delivery",
+)
+
+
+def is_question_message(text: str) -> bool:
+    """True if the message looks like the customer is asking a question rather than placing an order."""
+    if not text:
+        return False
+    if "?" in text:
+        return True
+    lower = text.lower().strip()
+    if not lower:
+        return False
+    for start in QUESTION_STARTS:
+        if lower == start or lower.startswith(start + " "):
+            return True
+    return False
+
+
+MODIFIER_CUES = (
+    " no ", " no.", " no,", "no mayo", "no cheese", "no onion", "no onions",
+    "no pyaaz", "no pyaz", "no salt", "no sugar", "no oil", "no spice",
+    "without", " extra ", " extra.", " extra,", " extra-", "thoda sa",
+    "less ", " kam ", " zyada", " zayada", " spicy", " teekha", " tikha",
+    " masala", " well done", " medium", " large", " small", " thoda",
+    " thori", " bin ", " baghair", "with extra", " elaichi", " achari",
+)
+
+
+def has_modifier_cue(text: str) -> bool:
+    """True if the text carries a modifier cue (no X, extra Y, etc.). Conservative — caller
+    should AND this with other evidence (e.g. a menu item is mentioned) to avoid false positives
+    on short unrelated words like 'no' in 'no thanks'."""
+    if not text:
+        return False
+    lower = (" " + text.lower().strip() + " ").replace("?", " ").replace(".", " ")
+    return any(cue in lower for cue in MODIFIER_CUES)
+
+
+REMOVE_CUES = (
+    "remove", "hatao", "hata do", "hata dein", "hata de", "cancel",
+    "delete", "nikalo", "nikal do", "nikal dein", "hatana", "nikalna",
+    "wo nahi", "wo hatao", "na chahiye", "mat dena", "mat do",
+    "nai chahiye", "nahi chahiye", "nai rakhna", "nai rakhna hai",
+    "wo nai chahiye", "wo nai", "wo cancel", "off karo", "off kardo",
+)
+
+
+def has_remove_cue(text: str) -> bool:
+    if not text:
+        return False
+    lower = text.lower()
+    return any(cue in lower for cue in REMOVE_CUES)

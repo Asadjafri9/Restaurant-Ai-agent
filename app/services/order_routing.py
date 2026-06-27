@@ -72,6 +72,10 @@ class OrderRoutingService:
                 menu_uuid = None
                 if mid:
                     menu_uuid = uuid.UUID(mid) if isinstance(mid, str) else mid
+                modifiers = item.get("modifiers") or item.get("notes")
+                modifiers = modifiers.strip() if isinstance(modifiers, str) else None
+                if not modifiers:
+                    modifiers = None
                 order_items.append(
                     OrderItem(
                         menu_item_id=menu_uuid,
@@ -79,6 +83,7 @@ class OrderRoutingService:
                         unit_price_snapshot=unit_price,
                         quantity=qty,
                         line_total=line_total,
+                        modifiers=modifiers,
                     )
                 )
 

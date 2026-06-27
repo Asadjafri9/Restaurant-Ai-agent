@@ -122,6 +122,30 @@ def test_multi_item_list_with_fizz_up_next():
     }
 
 
+def test_hi_does_not_add_chicken_piece():
+    from app.data.restaurants import RESTAURANTS
+
+    catalog = [
+        {"name": i["item"], "price": i["price_pkr"], "tenant_item_id": str(i["id"])}
+        for i in RESTAURANTS["kfc"]["menu"]
+    ]
+    for msg in ("hi", "hello", "yes", "han kardo", "Block C5", "kfc", "menu dikhao", "shukriya"):
+        items = extract_order_items(msg, catalog)
+        assert not any(i["item"] == "Chicken Piece (1 pc)" for i in items), msg
+
+
+def test_chicken_piece_requires_piece_word():
+    from app.data.restaurants import RESTAURANTS
+
+    catalog = [
+        {"name": i["item"], "price": i["price_pkr"], "tenant_item_id": str(i["id"])}
+        for i in RESTAURANTS["kfc"]["menu"]
+    ]
+    assert not extract_order_items("2 chicken", catalog)
+    items = extract_order_items("2 chicken piece", catalog)
+    assert len(items) == 1 and items[0]["item"] == "Chicken Piece (1 pc)"
+
+
 def test_order_correction_replaces_pending_items():
     from app.data.restaurants import RESTAURANTS
     from app.services.order_context import is_order_correction_message

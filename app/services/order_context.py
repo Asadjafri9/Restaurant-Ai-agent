@@ -130,27 +130,49 @@ def _normalize_item_tokens(name: str) -> str:
     return " ".join(_ITEM_TOKEN_ALIASES.get(w, w) for w in words)
 
 
+_ITEM_SIZE_TOKENS = frozenset({"1", "2", "3", "4", "5", "6", "7", "8", "9", "pc", "pcs", "l", "half", "large"})
+_GENERIC_FOOD_TOKENS = frozenset({"chicken", "burger", "piece", "hot", "beef", "roll", "fries", "kabab", "seekh"})
+
+
+def _meaningful_tokens(text: str) -> set[str]:
+    words = _normalize_item_tokens(text).split()
+    return {w for w in words if w not in _ITEM_SIZE_TOKENS and len(w) > 2 and not w.isdigit()}
+
+
+def _tokens_as_words(tokens: set[str], text: str) -> bool:
+    return bool(tokens) and all(re.search(rf"\b{re.escape(t)}\b", text) for t in tokens)
+
+
 def match_catalog_item(name: str, catalog: list[dict]) -> dict | None:
     """Fuzzy menu match — handles voice typos like chkn briyani → Chicken Biryani."""
     needle = _normalize_item_tokens(name)
     if not needle or not catalog:
         return None
+    needle_tokens = _meaningful_tokens(needle)
+    if not needle_tokens:
+        return None
     by_name = {i["name"].lower(): i for i in catalog}
     if needle in by_name:
         return by_name[needle]
     for key, item in by_name.items():
-        norm_key = _normalize_item_tokens(key)
-        if needle in norm_key or norm_key in needle:
+        base = _catalog_base_name(item["name"])
+        if base and re.search(rf"\b{re.escape(base)}\b", needle):
             return item
-    needle_tokens = set(needle.split())
     best: dict | None = None
     best_score = 0
     for key, item in by_name.items():
-        key_tokens = set(_normalize_item_tokens(key).split())
+        key_tokens = _meaningful_tokens(_catalog_base_name(item["name"]) or key)
         if not key_tokens:
             continue
+        if key_tokens <= needle_tokens:
+            return item
         overlap = len(needle_tokens & key_tokens)
         min_len = min(len(needle_tokens), len(key_tokens))
+        if len(key_tokens) >= 2 and overlap < len(key_tokens):
+            lone = len(needle_tokens) == 1 and overlap == 1
+            token = next(iter(needle_tokens & key_tokens), "")
+            if not (lone and token and token not in _GENERIC_FOOD_TOKENS):
+                continue
         if overlap > 0 and overlap >= max(1, min_len - 1) and overlap > best_score:
             best_score = overlap
             best = item
@@ -231,12 +253,14 @@ def _catalog_base_name(name: str) -> str:
 def _item_mentioned_in_text(normalized: str, cat_name: str, raw_text: str) -> bool:
     name = normalize_user_text(cat_name)
     base = _catalog_base_name(cat_name)
-    if name in normalized or base in normalized:
+    if base and re.search(rf"\b{re.escape(base)}\b", normalized):
         return True
-    base_tokens = [t for t in base.split() if len(t) > 2]
-    if len(base_tokens) >= 2 and all(t in normalized for t in base_tokens):
+    if name != base and re.search(rf"\b{re.escape(name)}\b", normalized):
         return True
-    if len(base_tokens) == 1 and len(base_tokens[0]) >= 4 and base_tokens[0] in normalized:
+    base_tokens = _meaningful_tokens(base or name)
+    if len(base_tokens) >= 2 and _tokens_as_words(base_tokens, normalized):
+        return True
+    if len(base_tokens) == 1 and _tokens_as_words(base_tokens, normalized):
         return True
     return match_catalog_item(raw_text, [{"name": cat_name}]) is not None
 
@@ -275,9 +299,10 @@ def _best_segment_for_item(text: str, cat_name: str, segments: list[str]) -> str
         seg_norm = normalize_user_text(seg)
         if _item_mentioned_in_text(seg_norm, cat_name, seg):
             return seg
-    whole = normalize_user_text(text)
-    if _item_mentioned_in_text(whole, cat_name, raw):
-        return text
+    if not segments:
+        whole = normalize_user_text(text)
+        if _item_mentioned_in_text(whole, cat_name, raw):
+            return text
     return None
 
 
@@ -471,3 +496,115 @@ def clear_pending_order(session) -> None:
     session.pending_customer_name = None
     session.pending_address = None
     session.pending_items = []
+
+
+def detect_remove_intent(text: str, catalog: list[dict]) -> str | None:
+    """Return the catalog item name the customer wants to remove, or None."""
+    from app.services.voice_text import REMOVE_CUES, has_remove_cue, normalize_user_text
+
+    if not text or not catalog:
+        return None
+    if not has_remove_cue(text):
+        return None
+    cleaned = text
+    for cue in sorted(REMOVE_CUES, key=len, reverse=True):
+        cleaned = re.sub(rf"\b{re.escape(cue)}\b", " ", cleaned, flags=re.I)
+    cleaned = normalize_user_text(cleaned).strip()
+    for filler in ("bhai", "ji", "please", "plz", "jani", "sir", "madam"):
+        cleaned = re.sub(rf"\b{re.escape(filler)}\b", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return None
+    for item in catalog:
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        if name.lower() in cleaned:
+            return name
+    sorted_catalog = sorted(catalog, key=lambda c: len(c.get("name", "")), reverse=True)
+    for item in sorted_catalog:
+        name = (item.get("name") or "").strip().lower()
+        if not name:
+            continue
+        for token in name.split():
+            if len(token) >= 4 and token in cleaned:
+                return item["name"]
+    best = match_catalog_item(cleaned, catalog)
+    if best:
+        return best["name"]
+    return None
+
+
+_QTY_PATTERNS = (
+    re.compile(r"\b(\d+)\s+([a-zA-Z][a-zA-Z\s'-]{2,})", re.I),
+    re.compile(r"([a-zA-Z][a-zA-Z\s'-]{2,})\s+(\d+)\s*(?:chahiye|order|kardo|kar do|karo|do)?", re.I),
+)
+
+
+def detect_set_qty_intent(text: str, catalog: list[dict]) -> tuple[str, int] | None:
+    """Return (item_name, new_quantity) for a 'make that N' or 'N items' style intent.
+
+    Conservative: only fires when the customer references a number AND a known menu item.
+    Returns None otherwise.
+    """
+    from app.services.voice_text import normalize_user_text
+
+    if not text or not catalog:
+        return None
+    lower = text.lower()
+    nums = re.findall(r"\b\d+\b", lower)
+    if not nums:
+        return None
+    qty = max(1, int(nums[0]))
+    for item in catalog:
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        if name.lower() in lower:
+            return name, qty
+    sorted_catalog = sorted(catalog, key=lambda c: len(c.get("name", "")), reverse=True)
+    for item in sorted_catalog:
+        name = (item.get("name") or "").strip().lower()
+        if not name:
+            continue
+        for token in name.split():
+            if len(token) < 4:
+                continue
+            if re.search(rf"\b\d+\b[^\d]{{0,8}}\b{re.escape(token)}\b", lower) or re.search(
+                rf"\b{re.escape(token)}\b[^\d]{{0,8}}\b\d+\b", lower
+            ):
+                return item["name"], qty
+    cleaned = normalize_user_text(text)
+    nums2 = re.findall(r"\b\d+\b", cleaned)
+    if not nums2:
+        return None
+    qty = max(1, int(nums2[0]))
+    for item in sorted_catalog:
+        name = (item.get("name") or "").strip().lower()
+        if not name:
+            continue
+        for token in name.split():
+            if len(token) < 4:
+                continue
+            if token in cleaned:
+                return item["name"], qty
+    return None
+
+
+def apply_pending_edit(session, *, remove: str | None = None, set_qty: tuple[str, int] | None = None) -> None:
+    """Mutate session.pending_items: remove a named item or set a new quantity for one item."""
+    if remove:
+        key = remove.lower()
+        session.pending_items = [
+            i for i in session.pending_items
+            if (i.get("item") or "").lower() != key
+        ]
+    if set_qty:
+        name, qty = set_qty
+        key = name.lower()
+        for i in session.pending_items:
+            if (i.get("item") or "").lower() == key:
+                i["quantity"] = max(1, int(qty))
+                return
+        # Not in cart yet — caller will need to add it
+        session.pending_items.append({"item": name, "quantity": max(1, int(qty))})

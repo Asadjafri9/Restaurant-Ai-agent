@@ -4,15 +4,19 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
 
 from app.core.tenant_ids import TENANT_IDS
-from app.services.agent.prompts import build_system_prompt
+from app.services.agent.prompts import build_system_prompt, format_grouped_menu, unique_categories
 from app.services.catalog_service import format_menu_text, get_menu_by_slug, list_active_restaurants
 from app.services.i18n import detect_language, msg
 from app.services.llm_client import LlmRateLimitError, generate_reply, provider_label
 from app.services.order_context import (
+    apply_pending_edit,
     bot_asked_for_more_items,
     clear_pending_order,
+    detect_remove_intent,
+    detect_set_qty_intent,
     extract_order_items,
     fix_name_transcript,
     format_order_summary,
@@ -30,6 +34,7 @@ from app.services.order_routing import order_routing
 from app.services.session_service import get_session_async, reset_session_async, save_session_async
 from app.services.voice_text import (
     URDU_YES_MARKERS,
+    has_modifier_cue,
     is_menu_request,
     is_mid_order_detail_reply,
     is_thank_you_message,
@@ -516,6 +521,7 @@ async def _persist_order(phone: str, order: dict, session) -> dict | None:
             cat = catalog_by_id[str(mid)]
         if not cat and name:
             cat = match_catalog_item(name, catalog)
+        notes = (item.get("notes") or "").strip() or None
         if cat:
             items.append(
                 {
@@ -523,6 +529,7 @@ async def _persist_order(phone: str, order: dict, session) -> dict | None:
                     "quantity": int(item.get("quantity", 1)),
                     "unit_price": cat["price"],
                     "menu_item_id": cat.get("tenant_item_id"),
+                    "modifiers": notes,
                 }
             )
         elif name and item.get("unit_price") is not None:
@@ -532,6 +539,7 @@ async def _persist_order(phone: str, order: dict, session) -> dict | None:
                     "quantity": int(item.get("quantity", 1)),
                     "unit_price": float(item["unit_price"]),
                     "menu_item_id": mid,
+                    "modifiers": notes,
                 }
             )
 
@@ -550,6 +558,7 @@ async def _persist_order(phone: str, order: dict, session) -> dict | None:
         delivery_address=order.get("address", ""),
         items=items,
         idempotency_key=idem,
+        notes=(order.get("special_requests") or "").strip() or None,
     )
 
     from app.services.provisioning import enqueue_job
@@ -820,6 +829,38 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
             session.pending_items,
         )
 
+    edit_applied = False
+    edit_summary: str | None = None
+    has_modifier_with_item = False
+    if (
+        session.active_tenant_slug
+        and session.state in ("ordering", "confirming")
+        and not is_yes
+        and not is_menu_request(user_message)
+        and not is_done_adding_items(user_message)
+        and not is_declining_more_items(user_message, _last_model_text(session))
+    ):
+        remove_name = detect_remove_intent(user_message, catalog_items)
+        if remove_name and any(
+            (i.get("item") or "").lower() == remove_name.lower()
+            for i in session.pending_items
+        ):
+            apply_pending_edit(session, remove=remove_name)
+            edit_applied = True
+            edit_summary = f"removed {remove_name}"
+        else:
+            set_qty = detect_set_qty_intent(user_message, catalog_items)
+            if set_qty:
+                apply_pending_edit(session, set_qty=set_qty)
+                edit_applied = True
+                edit_summary = f"set {set_qty[0]} to {set_qty[1]}"
+        if has_modifier_cue(user_message) and message_mentions_items(
+            user_message, catalog_items
+        ):
+            has_modifier_with_item = True
+
+    skip_items_added_reply = edit_applied or has_modifier_with_item
+
     if (
         session.active_tenant_slug
         and session.pending_items
@@ -831,6 +872,7 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
         and not is_menu_request(user_message)
         and not is_done_adding_items(user_message)
         and not is_declining_more_items(user_message, _last_model_text(session))
+        and not skip_items_added_reply
     ):
         added = None if order_correction else _labels_for_new_items(pending_snapshot, session.pending_items)
         reply = await _reply_after_items_added(
@@ -907,9 +949,30 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
         and not is_menu_request(user_message)
     )
 
+    now = datetime.now(timezone.utc)
+    last_order_summary = None
+    if session.confirmed_orders:
+        last_order = session.confirmed_orders[-1] or {}
+        last_order_summary = {
+            "restaurant": last_order.get("restaurant"),
+            "items": last_order.get("items") or [],
+        }
+    prompt_menu_block = menu_block
+    if session.active_tenant_slug and catalog_items:
+        prompt_menu_block = f"{active_name or session.active_tenant_slug} ({session.active_tenant_slug}):\n{format_grouped_menu(catalog_items)}"
+
+    if edit_summary:
+        edit_note = (
+            f"\nThe customer just edited their cart via a short message: {edit_summary}. "
+            "Acknowledge the edit naturally, show the updated cart if it changed, "
+            "and ask if there's anything else.\n"
+        )
+    else:
+        edit_note = ""
+
     system = build_system_prompt(
         restaurants=restaurants,
-        menu_block=menu_block,
+        menu_block=prompt_menu_block,
         active_restaurant=active_name,
         active_slug=session.active_tenant_slug,
         state=session.state,
@@ -918,7 +981,10 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
         pending_name=session.pending_customer_name,
         pending_address=session.pending_address,
         pending_items=session.pending_items,
-    )
+        now=now,
+        last_order_summary=last_order_summary,
+        categories=unique_categories(catalog_items) if catalog_items else None,
+    ) + edit_note
 
     history = []
     for h in session.history:
