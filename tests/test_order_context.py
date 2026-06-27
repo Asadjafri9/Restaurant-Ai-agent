@@ -1,4 +1,3 @@
-from app.services.order_agent import _is_no_message
 from app.services.order_context import (
     extract_address,
     extract_customer_name,
@@ -30,27 +29,8 @@ def test_extract_address():
     assert extract_address("Block C5") == "Block C5"
 
 
-def test_done_adding_not_treated_as_cancel():
+def test_done_adding_still_detected():
     assert is_done_adding_items("nahi bas itna hi kardo")
-    assert not _is_no_message("nahi bas itna hi kardo")
-
-
-def test_nahi_karna_when_asked_for_more_is_done_adding():
-    from app.services.order_agent import _last_model_text
-    from app.services.order_context import is_declining_more_items
-
-    session = CustomerSession(
-        phone="+923001234567",
-        state="ordering",
-        active_tenant_slug="kababjees",
-        pending_items=[{"item": "Chicken Biryani", "quantity": 1}],
-        history=[
-            {"role": "model", "parts": ["Kya aap kuch aur order karna chahte hain?"]},
-        ],
-    )
-    assert is_declining_more_items("nahi karna", _last_model_text(session))
-    assert not _is_no_message("nahi karna", session)
-    assert is_done_adding_items("nahi karna")
 
 
 def test_pending_order_tracking():

@@ -1,1234 +1,497 @@
+"""LLM-primary agent flow.
+
+The LLM is the single source of truth for the conversation. It returns a
+JSON object with the reply text AND the new cart state. Python just applies
+it and persists when place_order is true. No hardcoded intent waterfall.
+"""
+
 import asyncio
 import hashlib
 import json
-import logging
 import re
 import time
 from datetime import datetime, timezone
+from logging import getLogger
 
-from app.core.tenant_ids import TENANT_IDS
 from app.services.agent.prompts import build_system_prompt, format_grouped_menu, unique_categories
-from app.services.catalog_service import format_menu_text, get_menu_by_slug, list_active_restaurants
+from app.services.catalog_service import get_menu_by_slug, list_active_restaurants
 from app.services.i18n import detect_language, msg
-from app.services.llm_client import LlmRateLimitError, generate_reply, provider_label
-from app.services.order_context import (
-    apply_pending_edit,
-    bot_asked_for_more_items,
-    clear_pending_order,
-    detect_remove_intent,
-    detect_set_qty_intent,
-    extract_order_items,
-    fix_name_transcript,
-    format_order_summary,
-    format_pending_items_list,
-    is_declining_more_items,
-    is_done_adding_items,
-    is_order_correction_message,
-    match_catalog_item,
-    order_from_session,
-    pending_items_changed,
-    pending_order_complete,
-    update_pending_from_message,
-)
+from app.services.llm_client import LlmRateLimitError, generate_reply
 from app.services.order_routing import order_routing
 from app.services.session_service import get_session_async, reset_session_async, save_session_async
-from app.services.voice_text import (
-    URDU_YES_MARKERS,
-    has_modifier_cue,
-    is_menu_request,
-    is_mid_order_detail_reply,
-    is_thank_you_message,
-    message_mentions_items,
-    normalize_confirm_transcript,
-    normalize_user_text as _normalize_user_text,
-    resolve_restaurant_slug as _resolve_slug,
-    restaurant_named_in_text,
-    should_show_restaurant_menu,
-)
+from app.services.voice_text import normalize_user_text as _normalize_user_text
 
-logger = logging.getLogger(__name__)
+logger = getLogger(__name__)
 
-FAST_GREETINGS = frozenset(
-    {"hi", "hello", "hey", "hii", "hola", "salam", "aoa", "assalamualaikum", "asalamualaikum"}
-)
-MENU_KEYWORDS = frozenset({"menu", "show menu", "see menu", "full menu", "what's on the menu", "whats on the menu"})
-YES_WORDS = frozenset(
-    {
-        "yes",
-        "y",
-        "yeah",
-        "yep",
-        "confirm",
-        "ok",
-        "okay",
-        "done",
-        "place order",
-        "confirmed",
-        "haan",
-        "han",
-        "hann",
-        "ji",
-        "jee",
-        "theek",
-        "bilkul",
-        "agreed",
-        "correct",
-        "sahi",
-    }
-)
-YES_PHRASES = (
-    "han kardo",
-    "haan kardo",
-    "han kar do",
-    "haan kar do",
-    "confirm karo",
-    "confirm kar do",
-    "confirm kardo",
-    "theek hai",
-    "ok hai",
-    "ji haan",
-    "ji han",
-    "done hai",
-    "yes please",
-    "go ahead",
-    "place it",
-)
-YES_PHRASES_LONG = (
-    "han kardo",
-    "haan kardo",
-    "han kar do",
-    "haan kar do",
-    "confirm kardo",
-    "confirm kar do",
-    "theek hai",
-    "ji haan",
-    "yes confirm",
-    "confirm karo",
-)
-NO_WORDS = frozenset({"no", "n", "nope", "change", "cancel", "wrong", "nahi", "na", "mat"})
+ORDER_JSON_PATTERN = re.compile(r"\[ORDER_JSON\]\s*(\{.*?\})\s*\[/ORDER_JSON\]", re.DOTALL)
+_BARE_JSON_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
 
-ORDER_JSON_PATTERN = re.compile(
-    r"\[ORDER_JSON\]\s*(\{.*?\})\s*\[/ORDER_JSON\]",
-    re.DOTALL,
-)
-CONFIRM_PHRASES = (
-    "reply yes",
-    "yes to confirm",
-    "confirm or no",
-    "reply yes to confirm",
-    "yes likhein",
-    "confirm karne",
-    "han likhein",
-    "haan likhein",
-    "yes bhejein",
-    "confirm karein",
-    "theek hai to",
-    "order confirm",
-    "confirm karoon",
-    "confirm karna",
-)
-CONFIRM_SUMMARY_MARKERS = ("total", "rs ", "rs.", "grand total", "order summary", "kul ")
-CONFIRM_ASK_MARKERS = (
-    "confirm karne",
-    "yes likhein",
-    "yes to confirm",
-    "han kardo likhein",
-    "reply yes",
-    "confirm karein",
-    "confirm karoon",
-    "order summary",
-)
-ORDER_DONE_MARKERS = (
-    "order confirmed",
-    "order confirm ho gaya",
-    "confirm ho gaya",
-    "delivery:",
-    "delivery ",
-    "order id",
-    "dobara order",
-    "new order",
-    "45-60",
-)
-
-SHOW_ORDER_CUES = (
-    "show my order", "show order", "show the order", "order summary",
-    "summary of my order", "summarize my order", "summarize the order",
-    "summary please", "mera order", "order dikha", "order bata", "order batao",
-    "better format", "in better format", "in a better format", "nicer format",
-    "my order please", "order list", "list my order", "what did i order",
-    "what's in my order", "what have i ordered", "order review", "check my order",
-    "show cart", "my cart", "show items", "kya order kiya",
-    "kya hai mere order", "order detail", "order details",
-    "tell me my order", "show me my order", "mera order batao",
-    "order ka summary", "order ka kya hai",
-)
+RESET_WORDS = frozenset({"reset", "start over", "restart", "new order"})
 
 
-def _update_session_language(session, user_message: str) -> None:
-    """Keep Roman Urdu across short/ambiguous voice replies in the same chat."""
-    detected = detect_language(user_message)
-    if detected == "roman_ur":
-        session.language = "roman_ur"
-    elif not session.history:
-        session.language = detected
-    elif session.language != "roman_ur":
-        session.language = detected
+def _extract_json_object(raw_text: str) -> dict | None:
+    """Robustly extract the JSON object from the LLM reply.
 
-
-def _is_yes_message(text: str) -> bool:
-    if any(marker in text for marker in URDU_YES_MARKERS):
-        return True
-    raw_lower = text.lower()
-    if "confirm" in raw_lower and any(
-        x in raw_lower for x in ("haan", "han", "yes", "han kardo", "haan kardo", "ہاں", "हाँ")
-    ):
-        return True
-    normalized = _normalize_user_text(text)
-    if not normalized:
-        return False
-    words = normalized.split()
-    if len(words) <= 4:
-        if normalized in YES_WORDS:
-            return True
-        if words[0] in YES_WORDS:
-            return True
-        if any(phrase in normalized for phrase in YES_PHRASES):
-            return True
-        if re.match(r"^(han|haan|hann|ji|jee|yes|ok|okay|theek|bilkul|confirm)\b", normalized):
-            return True
-        return False
-    return any(phrase in normalized for phrase in YES_PHRASES_LONG)
-
-
-def _is_no_message(text: str, session=None) -> bool:
-    if is_order_correction_message(text):
-        return False
-    if is_done_adding_items(text):
-        return False
-    if session and session.pending_items and bot_asked_for_more_items(_last_model_text(session)):
-        if is_declining_more_items(text, _last_model_text(session)):
-            return False
-    normalized = _normalize_user_text(text)
-    if not normalized:
-        return False
-    if normalized in NO_WORDS:
-        return True
-    return normalized.split()[0] in NO_WORDS
-
-
-def _last_model_text(session) -> str:
-    for h in session.history:
-        if h.get("role") == "model":
-            parts = h.get("parts") or []
-            if parts:
-                return str(parts[0])
-    return ""
-
-
-def _conversation_awaiting_confirm(session) -> bool:
-    if session.state == "confirming" or session.awaiting_confirm:
-        return True
-    last = _last_model_text(session)
-    if not last:
-        return False
-    if bot_asked_for_more_items(last):
-        return False
-    if _looks_like_confirm_prompt(last):
-        return True
-    lower = last.lower()
-    has_summary = any(m in lower for m in CONFIRM_SUMMARY_MARKERS)
-    asks_confirm = any(m in lower for m in CONFIRM_ASK_MARKERS)
-    return has_summary and asks_confirm
-
-
-def _order_recently_completed(session) -> bool:
-    """True after a placed order — customer saying thanks should get a warm close."""
-    if session.state == "done":
-        return True
-    if session.confirmed_orders:
-        return True
-    last = _last_model_text(session).lower()
-    if any(m in last for m in ORDER_DONE_MARKERS):
-        return True
-    # Bot showed order summary / asked YES — customer may say shukriya after failed/successful flow
-    if session.state in ("confirming", "ordering") and session.pending_customer_name:
-        if any(m in last for m in CONFIRM_SUMMARY_MARKERS) or _looks_like_confirm_prompt(last):
-            return True
-    return False
-
-
-def _is_confirm_reply(text: str, session, catalog: list[dict] | None = None) -> bool:
-    """Broader YES when awaiting confirmation — catches garbled voice 'han kardo'."""
-    if is_thank_you_message(text):
-        return False
-    last_bot = _last_model_text(session)
-    if bot_asked_for_more_items(last_bot):
-        return False
-    if catalog and extract_order_items(text, catalog):
-        return False
-    if catalog and message_mentions_items(text, catalog):
-        return False
-    if _is_yes_message(text) and not _looks_like_order_add_message(text):
-        if session.state == "confirming" or session.awaiting_confirm or _conversation_awaiting_confirm(session):
-            return True
-        return False
-    if not (
-        session.state == "confirming"
-        or session.awaiting_confirm
-        or _conversation_awaiting_confirm(session)
-    ):
-        return False
-    if _is_no_message(text, session):
-        return False
-    if _looks_like_order_add_message(text):
-        return False
-    normalized = _normalize_user_text(normalize_confirm_transcript(text))
-    if not normalized or len(normalized.split()) > 8:
-        return False
-    words = set(normalized.split())
-    if words & {"han", "haan", "hann", "yes", "yep", "yeah", "ok", "okay", "ji", "jee", "theek", "bilkul", "confirm", "sahi", "done"}:
-        return True
-    confirm_phrases = ("han kardo", "haan kardo", "han kar do", "haan kar do", "confirm kardo", "kar do", "place order")
-    return any(p in normalized for p in confirm_phrases)
-
-
-def _looks_like_order_add_message(text: str) -> bool:
-    """Voice/text that lists food items — not a bare YES."""
-    normalized = _normalize_user_text(text)
-    if not normalized:
-        return False
-    food_tokens = (
-        "burger",
-        "wings",
-        "pepsi",
-        "cola",
-        "biryani",
-        "kabab",
-        "zinger",
-        "krusher",
-        "piece",
-        "fries",
-        "chicken",
-        "karahi",
-        "roll",
-        "naan",
-        "menu",
-    )
-    if any(t in normalized for t in food_tokens):
-        return True
-    if "kardo" in normalized and len(normalized.split()) > 3:
-        return True
-    return False
-
-
-def _match_catalog_item(name: str, catalog_by_name: dict[str, dict]) -> dict | None:
-    """Delegate to shared fuzzy matcher (catalog_by_name kept for tests)."""
-    catalog = list(catalog_by_name.values())
-    return match_catalog_item(name, catalog)
-
-
-def _looks_like_confirm_prompt(text: str) -> bool:
-    lower = text.lower()
-    return any(p in lower for p in CONFIRM_PHRASES)
-
-
-def _order_summary_in_reply(text: str) -> bool:
-    lower = text.lower()
-    has_total = any(m in lower for m in CONFIRM_SUMMARY_MARKERS)
-    asks_confirm = any(m in lower for m in CONFIRM_ASK_MARKERS)
-    return has_total and asks_confirm
-
-
-def _strip_order_json(text: str) -> tuple[str, dict | None]:
-    match = ORDER_JSON_PATTERN.search(text)
-    if not match:
-        return text.strip(), None
-    customer_text = ORDER_JSON_PATTERN.sub("", text).strip()
+    Tries, in order: bare JSON object parse, [ORDER_JSON] fenced block,
+    text-with-mixed-text-first. Strips markdown fences.
+    """
+    if not raw_text:
+        return None
+    text = raw_text.strip()
+    # Strip common markdown code fences if present
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```\s*$", "", text)
     try:
-        return customer_text, json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return customer_text, None
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Try fenced [ORDER_JSON] block
+    m = ORDER_JSON_PATTERN.search(raw_text)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # Try locating the outermost braces
+    brace_match = _BARE_JSON_PATTERN.search(raw_text)
+    if brace_match:
+        candidate = brace_match.group(0)
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return None
 
 
-def _apply_restaurant_choice(session, slug: str) -> bool:
-    """Set active restaurant; returns True if customer switched from another."""
-    switched = bool(session.active_tenant_slug and session.active_tenant_slug != slug)
-    session.active_tenant_slug = slug
-    session.active_tenant_id = str(TENANT_IDS.get(slug, ""))
-    session.state = "ordering"
-    if switched:
-        session.history = []
-        clear_pending_order(session)
-    return switched
-
-
-def _update_session_from_message(session, user_message: str, restaurants: list[dict]) -> tuple[str | None, bool]:
-    """Update session state. Returns (slug, switched) if user picked/switched restaurant."""
-    normalized = _normalize_user_text(user_message)
-    if normalized in {"reset", "start over", "restart", "new order"}:
-        session.active_tenant_slug = None
-        session.active_tenant_id = None
-        session.state = "greeting"
-        session.awaiting_confirm = False
-        clear_pending_order(session)
-        session.history = []
-        return None, False
-
-    slug = _resolve_slug(user_message, restaurants)
-    if slug:
-        switched = _apply_restaurant_choice(session, slug)
-        return slug, switched
-
-    awaiting = _conversation_awaiting_confirm(session)
-    if (
-        _is_confirm_reply(user_message, session)
-        and (session.state in ("ordering", "confirming") or awaiting)
-        and not bot_asked_for_more_items(_last_model_text(session))
-        and not _looks_like_order_add_message(user_message)
-    ):
-        session.state = "confirming"
-    elif _is_no_message(user_message, session):
-        session.state = "ordering"
-    return None, False
-
-
-async def _menu_block_for_session(session, restaurants: list[dict], user_message: str) -> str:
-    if session.active_tenant_slug:
-        _, items = await get_menu_by_slug(session.active_tenant_slug, force_refresh=True)
-        name = next(
-            (r["name"] for r in restaurants if r["slug"] == session.active_tenant_slug),
-            session.active_tenant_slug,
+def _validate_cart_items(items_raw, catalog: list[dict]) -> list[dict]:
+    """Validate cart items against the catalog. Returns cleaned items with
+    exact menu names, integer quantities, notes strings. Items not in the
+    catalog are dropped (the LLM hallucinated them).
+    """
+    if not isinstance(items_raw, list):
+        return []
+    by_name = {i["name"].lower(): i for i in catalog if i.get("name")}
+    cleaned: list[dict] = []
+    for it in items_raw:
+        if not isinstance(it, dict):
+            continue
+        raw_name = (it.get("item") or it.get("name") or "").strip()
+        if not raw_name:
+            continue
+        cat = by_name.get(raw_name.lower())
+        if not cat:
+            continue
+        try:
+            qty = int(it.get("quantity", 1))
+        except (TypeError, ValueError):
+            qty = 1
+        if qty < 1:
+            continue
+        notes = it.get("notes") or ""
+        if not isinstance(notes, str):
+            notes = str(notes)
+        notes = notes.strip()
+        cleaned.append(
+            {
+                "item": cat["name"],
+                "quantity": qty,
+                "unit_price": float(cat.get("price", 0)),
+                "menu_item_id": cat.get("tenant_item_id"),
+                "notes": notes or None,
+            }
         )
-        if items:
-            return f"{name} ({session.active_tenant_slug}):\n{format_menu_text(items)}"
-        return f"{name} ({session.active_tenant_slug}): (menu empty)"
-
-    lines = [f"- {r['name']} (slug: {r['slug']})" for r in restaurants]
-    return "Available restaurants:\n" + "\n".join(lines)
+    return cleaned
 
 
-def _menu_already_sent(session) -> bool:
-    for h in session.history:
-        if h.get("role") != "model":
-            continue
-        parts = h.get("parts") or []
-        if not parts:
-            continue
-        text = str(parts[0]).lower()
-        if "full menu" in text or "poora menu" in text or "here's the menu" in text:
-            return True
-        if text.count("rs ") >= 3 or text.count("— rs") >= 3:
-            return True
-    return False
+async def _build_menu_block(session, restaurants: list[dict]) -> tuple[str, list[dict], str, list[str]]:
+    """Return (menu_block_for_prompt, catalog_items, active_name, categories)."""
+    catalog: list[dict] = []
+    active_name = None
+    slug = session.active_tenant_slug
+    if slug:
+        _, catalog = await get_menu_by_slug(slug, force_refresh=True)
+        active_name = next((r["name"] for r in restaurants if r["slug"] == slug), slug)
+    if catalog:
+        menu_block = f"{active_name} ({slug}):\n{format_grouped_menu(catalog)}"
+        return menu_block, catalog, active_name, unique_categories(catalog)
+    return "(customer must pick KFC or Kababjees first)", [], None, []
 
 
-async def _try_serve_catalog_menu(session, user_message: str, restaurants: list[dict]) -> str | None:
-    """Serve the real catalog menu — never let the LLM invent items or prices."""
-    slug = _resolve_slug(user_message, restaurants) or session.active_tenant_slug
+async def _finalize_order_from_json(phone: str, order_obj: dict, session) -> str | None:
+    """Build a persisted order from the LLM's JSON and call order_routing."""
+    slug = (order_obj.get("restaurant") or session.active_tenant_slug or "").strip().lower()
     if not slug:
         return None
-
-    _, catalog_items = await get_menu_by_slug(slug, force_refresh=True)
-    if not catalog_items:
-        return None
-
-    normalized = _normalize_user_text(user_message)
-    menu_intent = (
-        is_menu_request(user_message)
-        or "menu" in normalized
-        or any(k in normalized for k in MENU_KEYWORDS)
-    )
-    has_items = message_mentions_items(user_message, catalog_items)
-    restaurant_named = restaurant_named_in_text(user_message, slug, restaurants)
-
-    if not menu_intent and not (has_items and restaurant_named and not _menu_already_sent(session)):
-        return None
-
-    switched = bool(session.active_tenant_slug and session.active_tenant_slug != slug)
-    _apply_restaurant_choice(session, slug)
-    update_pending_from_message(session, user_message, catalog_items)
-    return await _reply_with_menu(slug, restaurants, switched, session.language, session)
-
-
-async def _reply_with_menu(
-    slug: str,
-    restaurants: list[dict],
-    switched: bool,
-    lang: str,
-    session=None,
-) -> str | None:
-    """Deterministic menu reply when customer picks a restaurant — no LLM needed."""
-    _, items = await get_menu_by_slug(slug, force_refresh=True)
-    name = next((r["name"] for r in restaurants if r["slug"] == slug), slug)
-    if not items:
-        return msg("menu_empty", lang, name=name)
-    intro_key = "menu_intro_switch" if switched else "menu_intro_pick"
-    intro = msg(intro_key, lang, name=name)
-    menu = format_menu_text(items)
-    parts = [intro]
-    has_pending = bool(session and session.pending_items)
-    if has_pending:
-        added = ", ".join(
-            f"{int(i.get('quantity', 1))}x {i.get('item', '')}" for i in session.pending_items
-        )
-        parts.append(msg("menu_item_added", lang, items=added))
-    parts.append(msg("menu_full_header", lang, name=name) + "\n" + menu)
-    if has_pending:
-        parts.append(msg("menu_ask_more", lang))
-    else:
-        parts.append(msg("menu_ask", lang))
-    return "\n\n".join(parts)
-
-
-async def _reply_after_items_added(
-    session,
-    lang: str,
-    *,
-    added_labels: str | None = None,
-    corrected: bool = False,
-) -> str:
-    items_text = format_pending_items_list(session.pending_items)
-    parts: list[str] = []
-    if corrected:
-        parts.append(msg("order_corrected", lang))
-    elif added_labels:
-        parts.append(msg("items_added_now", lang, items=added_labels))
-    parts.append(msg("order_updated", lang, items=items_text))
-    return "\n\n".join(parts)
-
-
-def _labels_for_new_items(before: list[dict], after: list[dict]) -> str:
-    before_sig = {i["item"].lower(): int(i.get("quantity", 1)) for i in before}
-    labels: list[str] = []
-    for item in after:
-        key = item["item"].lower()
-        qty = int(item.get("quantity", 1))
-        prev = before_sig.get(key, 0)
-        delta = qty - prev
-        if delta > 0:
-            labels.append(f"{delta}x {item['item']}")
-    return ", ".join(labels)
-
-
-async def _persist_order(phone: str, order: dict, session) -> dict | None:
-    slug = (order.get("restaurant") or session.active_tenant_slug or "").lower().replace(" ", "")
-    for r_slug in ("kababjees", "kfc"):
-        if r_slug in slug:
-            slug = r_slug
-            break
-
     tenant_id, catalog = await get_menu_by_slug(slug, force_refresh=True)
     if not tenant_id:
-        logger.warning("No tenant for restaurant %s", slug)
+        logger.warning("persist: no tenant for slug=%s", slug)
         return None
-
-    catalog_by_id = {
-        str(i.get("tenant_item_id")): i for i in catalog if i.get("tenant_item_id")
-    }
-    items = []
-    for item in order.get("items", []):
-        name = (item.get("item") or item.get("name") or "").strip()
-        mid = item.get("menu_item_id")
-        cat = None
-        if mid and str(mid) in catalog_by_id:
-            cat = catalog_by_id[str(mid)]
-        if not cat and name:
-            cat = match_catalog_item(name, catalog)
-        notes = (item.get("notes") or "").strip() or None
-        if cat:
-            items.append(
-                {
-                    "name": cat["name"],
-                    "quantity": int(item.get("quantity", 1)),
-                    "unit_price": cat["price"],
-                    "menu_item_id": cat.get("tenant_item_id"),
-                    "modifiers": notes,
-                }
-            )
-        elif name and item.get("unit_price") is not None:
-            items.append(
-                {
-                    "name": name,
-                    "quantity": int(item.get("quantity", 1)),
-                    "unit_price": float(item["unit_price"]),
-                    "menu_item_id": mid,
-                    "modifiers": notes,
-                }
-            )
-
-    if not items:
-        logger.warning("No valid items for order slug=%s items=%s", slug, order.get("items"))
+    cleaned_items = _validate_cart_items(order_obj.get("items"), catalog)
+    if not cleaned_items:
+        logger.warning("persist: no usable items in %s", order_obj.get("items"))
         return None
-
     items_key = hashlib.sha256(
-        json.dumps(order.get("items", []), sort_keys=True, default=str).encode()
+        json.dumps(order_obj.get("items", []), sort_keys=True, default=str).encode()
     ).hexdigest()[:16]
-    idem = f"{phone}:{slug}:{order.get('customer_name', '')}:{items_key}"
+    name = (order_obj.get("customer_name") or "").strip()
+    address = (order_obj.get("address") or "").strip()
+    idem = f"{phone}:{slug}:{name}:{address}:{items_key}"
+    notes = (order_obj.get("special_requests") or "").strip() or None
     result = await order_routing.create_order(
         tenant_id,
         customer_phone=phone,
-        customer_name=order.get("customer_name", ""),
-        delivery_address=order.get("address", ""),
-        items=items,
+        customer_name=name,
+        delivery_address=address,
+        items=[
+            {
+                "name": i["item"],
+                "quantity": i["quantity"],
+                "unit_price": i["unit_price"],
+                "menu_item_id": i.get("menu_item_id"),
+                "modifiers": i.get("notes"),
+            }
+            for i in cleaned_items
+        ],
         idempotency_key=idem,
-        notes=(order.get("special_requests") or "").strip() or None,
+        notes=notes,
     )
-
-    from app.services.provisioning import enqueue_job
-    from app.services.realtime import publish_order_event
-
-    await enqueue_job("sync_outboxes", {"tenant_id": str(tenant_id)})
-    await publish_order_event(
-        tenant_id,
-        {"type": "order_created", "order_id": result["order_id"], "status": "placed"},
-    )
-    logger.info("Order persisted: %s tenant=%s", result, slug)
+    try:
+        from app.services.provisioning import enqueue_job
+        from app.services.realtime import publish_order_event
+        await enqueue_job("sync_outboxes", {"tenant_id": str(tenant_id)})
+        await publish_order_event(
+            tenant_id,
+            {"type": "order_created", "order_id": result["order_id"], "status": "placed"},
+        )
+    except Exception:
+        logger.exception("post-persist event failed (non-fatal)")
     session.state = "done"
     session.active_tenant_slug = slug
-    clear_pending_order(session)
+    session.pending_customer_name = None
+    session.pending_address = None
+    session.pending_items = []
+    session.confirmed_orders.append(
+        {
+            "restaurant": slug,
+            "customer_name": name,
+            "address": address,
+            "items": cleaned_items,
+        }
+    )
+    logger.info("Order persisted for %s slug=%s", phone[:6] + "***", slug)
     return result
 
 
-def _is_show_order_request(text: str) -> bool:
-    """True when the customer wants to see their order / cart, not add or edit it."""
-    if not text:
-        return False
-    lower = text.lower()
-    return any(cue in lower for cue in SHOW_ORDER_CUES)
-
-
-def _missing_order_details(order: dict, session) -> list[str]:
-    """Return ['name'] / ['address'] / ['name','address'] for what is still missing."""
-    missing: list[str] = []
-    if not (order.get("customer_name") or session.pending_customer_name):
-        missing.append("name")
-    if not (order.get("address") or session.pending_address):
-        missing.append("address")
-    return missing
-
-
-def _ask_for_missing_detail(missing: list[str], lang: str) -> str:
-    if "name" in missing and "address" in missing:
-        return msg("ask_name", lang) + "\n" + msg("ask_address", lang)
-    if "name" in missing:
-        return msg("ask_name", lang)
-    return msg("ask_address", lang)
-
-
-def _fast_greeting(restaurants: list[dict], lang: str) -> str:
-    if not restaurants:
-        return msg("no_restaurants", lang)
-    names = [r["name"] for r in restaurants]
-    if len(names) == 2:
-        list_text = f"{names[0]} or {names[1]}"
-    else:
-        list_text = ", ".join(names)
-    return msg("greeting", lang, restaurants=list_text)
-
-
-def _smart_fallback_reply(session, restaurants: list[dict], catalog_items: list[dict]) -> str:
-    """Useful reply when LLM is rate-limited — avoid generic 'can't respond'."""
+async def _smart_fallback_reply(session, restaurants: list[dict], catalog: list[dict]) -> str:
+    """When the LLM is rate-limited / errors, produce a useful deterministic reply."""
     lang = session.language
-    if session.awaiting_confirm and pending_order_complete(session):
-        return format_order_summary(session, catalog_items, lang)
+    if not session.active_tenant_slug:
+        if not restaurants:
+            return msg("no_restaurants", lang)
+        names = [r["name"] for r in restaurants]
+        list_text = " or ".join(names) if len(names) == 2 else ", ".join(names)
+        return msg("greeting", lang, restaurants=list_text)
     if session.pending_items:
+        items_text = "\n".join(
+            f"{int(i.get('quantity', 1))}x {i.get('item', '')}" for i in session.pending_items
+        )
         if not session.pending_customer_name:
-            return msg("ask_name", lang)
+            return f"{items_text}\n\n{msg('ask_name', lang)}"
         if not session.pending_address:
-            return msg("ask_address", lang)
-        return format_order_summary(session, catalog_items, lang)
-    if not session.history:
-        return _fast_greeting(restaurants, lang)
-    return msg("rate_limit", lang)
-
-
-async def _extract_order_on_confirm(
-    phone: str,
-    user_message: str,
-    session,
-    restaurants: list[dict],
-    history: list[dict],
-    menu_block: str,
-) -> tuple[str | None, dict | None]:
-    """Force ORDER_JSON extraction when the customer replies YES."""
-    active_name = None
-    if session.active_tenant_slug:
-        active_name = next(
-            (r["name"] for r in restaurants if r["slug"] == session.active_tenant_slug),
-            session.active_tenant_slug,
+            return f"{items_text}\n\n{msg('ask_address', lang)}"
+        # Show summary
+        total = 0.0
+        lines = []
+        for pi in session.pending_items:
+            by_name = {c["name"].lower(): c for c in catalog} if catalog else {}
+            cat = by_name.get(pi["item"].lower(), {})
+            price = float(cat.get("price", 0))
+            qty = int(pi.get("quantity", 1))
+            line = price * qty
+            total += line
+            lines.append(f"{qty}x {pi['item']} — Rs {line:.0f}")
+        items_str = "\n".join(lines)
+        return (
+            f"Order summary:\n{items_str}\n"
+            f"Name: {session.pending_customer_name}\n"
+            f"Address: {session.pending_address}\n"
+            f"Total: Rs {total:.0f}\n\n"
+            f"{msg('ask_name', lang) if False else 'Reply YES to confirm.'}"
         )
-    confirm_system = (
-        build_system_prompt(
-            restaurants=restaurants,
-            menu_block=menu_block,
-            active_restaurant=active_name,
-            active_slug=session.active_tenant_slug,
-            state="confirming",
-            language=session.language,
-            pending_name=session.pending_customer_name,
-            pending_address=session.pending_address,
-            pending_items=session.pending_items,
-        )
-        + "\n\nThe customer just confirmed their order (YES / haan / han kardo / etc.). "
-        "Respond with ONLY the ORDER_JSON block — no other text. "
-        "Use exact menu item names from the menu above and details from conversation history."
-    )
-    raw_text = await generate_reply(confirm_system, history, user_message)
-    _, order = _strip_order_json(raw_text or "")
-    if not order:
-        retry_system = (
-            confirm_system
-            + "\n\nIMPORTANT: Build ORDER_JSON from the full conversation — items, customer name, "
-            "and delivery address already mentioned by the customer. Output ONLY [ORDER_JSON]...[/ORDER_JSON]."
-        )
-        raw_text = await generate_reply(retry_system, history, user_message)
-        _, order = _strip_order_json(raw_text or "")
-    if not order:
-        order = order_from_session(session)
-    if order:
-        order["customer_name"] = order.get("customer_name") or session.pending_customer_name or ""
-        order["address"] = order.get("address") or session.pending_address or ""
-        if not order.get("items") and session.pending_items:
-            order["items"] = list(session.pending_items)
-    if not order:
-        return None, None
-    order["phone"] = phone
-    if not order.get("restaurant") and session.active_tenant_slug:
-        order["restaurant"] = session.active_tenant_slug
-    return raw_text, order
-
-
-async def _finalize_order(
-    phone: str, order: dict, session, *, persist_fail_message: str
-) -> str:
-    lang = session.language
-    try:
-        result = await _persist_order(phone, order, session)
-        if result:
-            session.confirmed_orders.append(order)
-            return msg(
-                "order_confirmed",
-                lang,
-                total=result["total"],
-                order_id=result["order_id"][:8].upper(),
-            )
-        return persist_fail_message
-    except Exception:
-        logger.exception("Order persist failed for %s", phone[:6] + "***")
-        return msg("persist_error", lang)
+    return msg("menu_ask", lang)
 
 
 async def process_order_message_async(phone: str, user_message: str) -> str:
     t0 = time.perf_counter()
-    user_message = fix_name_transcript(user_message)
-    user_message = normalize_confirm_transcript(user_message)
+    user_message = (user_message or "").strip()
     normalized = _normalize_user_text(user_message)
 
-    if normalized in {"reset", "start over", "restart", "new order"}:
+    if normalized in RESET_WORDS:
         await reset_session_async(phone)
 
-    session, restaurants = await asyncio.gather(
-        get_session_async(phone),
-        list_active_restaurants(),
-    )
-    catalog_items: list[dict] = []
+    session, restaurants = await _gather_session_and_restaurants(phone)
+    if hasattr(session, "language") and not session.language:
+        session.language = detect_language(user_message) or "en"
+    lang = session.language
 
-    _update_session_language(session, user_message)
+    try:
+        await _light_routing(session, user_message, restaurants, normalized)
+    except Exception:
+        logger.exception("light routing failed (non-fatal)")
 
-    # Thanks / shukriya — before YES detection (shukriya contains "ji" as substring)
-    if is_thank_you_message(user_message):
-        if _order_recently_completed(session):
-            reply = msg("thank_you_closing", session.language)
-            session.state = "done"
-            session.awaiting_confirm = False
-        else:
-            reply = msg("thank_you_ack", session.language)
-        session.history = [
-            {"role": "user", "parts": [user_message]},
-            {"role": "model", "parts": [reply]},
-        ] + session.history[-16:]
-        await save_session_async(session)
-        logger.info("Thank-you reply for %s in %.2fs", phone[:6] + "***", time.perf_counter() - t0)
-        return reply
-
-    # Restaurant pick → show ONLY that restaurant's menu (before session state is updated)
-    detected_slug = _resolve_slug(user_message, restaurants)
-    if detected_slug:
-        pick_switched = bool(session.active_tenant_slug and session.active_tenant_slug != detected_slug)
-        _, catalog_items = await get_menu_by_slug(detected_slug, force_refresh=True)
-        has_items = bool(catalog_items) and message_mentions_items(user_message, catalog_items)
-        wants_menu = is_menu_request(user_message) or should_show_restaurant_menu(
-            user_message, detected_slug, session, catalog_items
-        )
-        if wants_menu or (
-            has_items and restaurant_named_in_text(user_message, detected_slug, restaurants)
-        ):
-            _apply_restaurant_choice(session, detected_slug)
-            update_pending_from_message(session, user_message, catalog_items)
-            menu_reply = await _reply_with_menu(
-                detected_slug, restaurants, pick_switched, session.language, session
-            )
-            if menu_reply:
-                session.history = [
-                    {"role": "user", "parts": [user_message]},
-                    {"role": "model", "parts": [menu_reply]},
-                ] + session.history[-14:]
-                await save_session_async(session)
-                logger.info(
-                    "Menu reply for %s slug=%s in %.2fs",
-                    phone[:6] + "***",
-                    detected_slug,
-                    time.perf_counter() - t0,
-                )
-                return menu_reply
-
-    chosen_slug, switched = _update_session_from_message(session, user_message, restaurants)
-    if session.active_tenant_slug:
-        _, catalog_items = await get_menu_by_slug(session.active_tenant_slug, force_refresh=True)
-    is_yes = _is_confirm_reply(user_message, session, catalog_items)
-    awaiting_confirm = _conversation_awaiting_confirm(session)
-
-    detected_for_menu = _resolve_slug(user_message, restaurants)
-    if detected_for_menu and detected_for_menu != session.active_tenant_slug:
-        _apply_restaurant_choice(session, detected_for_menu)
-    menu_slug = detected_for_menu or session.active_tenant_slug
-    if is_menu_request(user_message) and menu_slug:
-        if not session.active_tenant_slug:
-            _apply_restaurant_choice(session, menu_slug)
-        _, catalog_items = await get_menu_by_slug(menu_slug, force_refresh=True)
-        update_pending_from_message(session, user_message, catalog_items)
-        menu_reply = await _reply_with_menu(menu_slug, restaurants, False, session.language, session)
-        if menu_reply:
-            session.history = [
-                {"role": "user", "parts": [user_message]},
-                {"role": "model", "parts": [menu_reply]},
-            ] + session.history[-14:]
-            await save_session_async(session)
-            logger.info("Menu request for %s slug=%s in %.2fs", phone[:6] + "***", menu_slug, time.perf_counter() - t0)
-            return menu_reply
-
-    if any(k in normalized for k in MENU_KEYWORDS) and session.active_tenant_slug:
-        _, catalog_items = await get_menu_by_slug(session.active_tenant_slug, force_refresh=True)
-        update_pending_from_message(session, user_message, catalog_items)
-        menu_reply = await _reply_with_menu(
-            session.active_tenant_slug, restaurants, False, session.language, session
-        )
-        if menu_reply:
-            session.history = [
-                {"role": "user", "parts": [user_message]},
-                {"role": "model", "parts": [menu_reply]},
-            ] + session.history[-14:]
-            await save_session_async(session)
-            return menu_reply
-
-    if normalized in FAST_GREETINGS and not session.history:
-        reply = _fast_greeting(restaurants, session.language)
-        session.history = [
-            {"role": "user", "parts": [user_message]},
-            {"role": "model", "parts": [reply]},
-        ]
-        session.state = "greeting"
-        await save_session_async(session)
-        logger.info("Fast greeting for %s in %.2fs", phone[:6] + "***", time.perf_counter() - t0)
-        return reply
-
-    # Confirm YES before mutating pending order from a short voice transcript
-    if is_yes and (session.state == "confirming" or awaiting_confirm or session.awaiting_confirm):
-        if session.active_tenant_slug:
-            _, catalog_items = await get_menu_by_slug(session.active_tenant_slug, force_refresh=True)
-        order = order_from_session(session)
-        if order:
-            missing = _missing_order_details(order, session)
-            if missing:
-                customer_reply = _ask_for_missing_detail(missing, session.language)
-                session.awaiting_confirm = True
-                if session.state == "done":
-                    session.state = "ordering"
-                session.history = [
-                    {"role": "user", "parts": [user_message]},
-                    {"role": "model", "parts": [customer_reply[:2000]]},
-                ] + session.history[-16:]
-                await save_session_async(session)
-                logger.info(
-                    "Early confirm blocked: missing %s for %s in %.2fs",
-                    missing,
-                    phone[:6] + "***",
-                    time.perf_counter() - t0,
-                )
-                return customer_reply
-            order["phone"] = phone
-            persist_fail_message = msg("persist_fail", session.language)
-            customer_reply = await _finalize_order(
-                phone, order, session, persist_fail_message=persist_fail_message
-            )
-            session.awaiting_confirm = False
-            session.history = [
-                {"role": "user", "parts": [user_message]},
-                {"role": "model", "parts": [customer_reply[:2000]]},
-            ] + session.history[-16:]
-            if session.state != "done":
-                session.state = "confirming"
-            await save_session_async(session)
-            logger.info("Early confirm for %s placed=%s in %.2fs", phone[:6] + "***", session.state == "done", time.perf_counter() - t0)
-            return customer_reply
-
-    menu_block = await _menu_block_for_session(session, restaurants, user_message)
-    pending_snapshot = list(session.pending_items)
-    order_correction = is_order_correction_message(user_message)
-    if session.active_tenant_slug and not is_thank_you_message(user_message):
-        _, catalog_items = await get_menu_by_slug(session.active_tenant_slug, force_refresh=True)
-        update_pending_from_message(session, user_message, catalog_items)
-        logger.info(
-            "Pending order for %s: name=%s addr=%s items=%s",
-            phone[:6] + "***",
-            session.pending_customer_name,
-            session.pending_address,
-            session.pending_items,
-        )
-
-    edit_applied = False
-    edit_summary: str | None = None
-    edit_kind: str | None = None
-    has_modifier_with_item = False
-    if (
-        session.active_tenant_slug
-        and session.state in ("ordering", "confirming")
-        and not is_yes
-        and not is_menu_request(user_message)
-        and not is_done_adding_items(user_message)
-        and not is_declining_more_items(user_message, _last_model_text(session))
-    ):
-        remove_name = detect_remove_intent(user_message, catalog_items)
-        if remove_name and any(
-            (i.get("item") or "").lower() == remove_name.lower()
-            for i in session.pending_items
-        ):
-            apply_pending_edit(session, remove=remove_name)
-            edit_applied = True
-            edit_kind = "remove"
-            edit_summary = f"removed {remove_name}"
-        else:
-            set_qty = detect_set_qty_intent(user_message, catalog_items, session)
-            if set_qty:
-                apply_pending_edit(session, set_qty=set_qty)
-                edit_applied = True
-                edit_kind = "set_qty"
-                edit_summary = f"set {set_qty[0]} to {set_qty[1]}"
-        if has_modifier_cue(user_message) and message_mentions_items(
-            user_message, catalog_items
-        ):
-            has_modifier_with_item = True
-
-    skip_items_added_reply = edit_applied or has_modifier_with_item
-
-    if edit_applied and edit_kind in ("remove", "set_qty"):
-        items_text = format_pending_items_list(session.pending_items)
-        if not items_text:
-            customer_reply = msg("menu_ask", session.language)
-        else:
-            customer_reply = msg("order_updated", session.language, items=items_text)
-        session.state = "ordering"
-        session.awaiting_confirm = False
-        session.history = [
-            {"role": "user", "parts": [user_message]},
-            {"role": "model", "parts": [customer_reply[:2000]]},
-        ] + session.history[-16:]
-        await save_session_async(session)
-        logger.info(
-            "Deterministic edit reply (%s) for %s in %.2fs",
-            edit_kind,
-            phone[:6] + "***",
-            time.perf_counter() - t0,
-        )
-        return customer_reply
-
-    if _is_show_order_request(user_message) and session.active_tenant_slug and not is_yes:
-        if not catalog_items:
-            _, catalog_items = await get_menu_by_slug(
-                session.active_tenant_slug, force_refresh=True
-            )
-        if session.pending_items:
-            if pending_order_complete(session):
-                customer_reply = format_order_summary(
-                    session, catalog_items, session.language
-                )
-                session.state = "confirming"
-                session.awaiting_confirm = True
-            else:
-                items_text = format_pending_items_list(session.pending_items)
-                missing = _missing_order_details({}, session)
-                ask = _ask_for_missing_detail(missing, session.language)
-                customer_reply = (
-                    f"Here's your order so far:\n{items_text}\n\n{ask}"
-                )
-                session.state = "ordering"
-                session.awaiting_confirm = False
-        else:
-            customer_reply = msg("menu_ask", session.language)
-            session.state = "ordering"
-            session.awaiting_confirm = False
-        session.history = [
-            {"role": "user", "parts": [user_message]},
-            {"role": "model", "parts": [customer_reply]},
-        ] + session.history[-16:]
-        await save_session_async(session)
-        logger.info("Show-order shortcut for %s in %.2fs", phone[:6] + "***", time.perf_counter() - t0)
-        return customer_reply
-
-    if (
-        session.active_tenant_slug
-        and session.pending_items
-        and (
-            pending_items_changed(pending_snapshot, session.pending_items)
-            or order_correction
-        )
-        and not is_yes
-        and not is_menu_request(user_message)
-        and not is_done_adding_items(user_message)
-        and not is_declining_more_items(user_message, _last_model_text(session))
-        and not skip_items_added_reply
-    ):
-        added = None if order_correction else _labels_for_new_items(pending_snapshot, session.pending_items)
-        reply = await _reply_after_items_added(
-            session,
-            session.language,
-            added_labels=added or None,
-            corrected=order_correction,
-        )
-        session.state = "ordering"
-        session.awaiting_confirm = False
-        session.history = [
-            {"role": "user", "parts": [user_message]},
-            {"role": "model", "parts": [reply]},
-        ] + session.history[-16:]
-        await save_session_async(session)
-        logger.info("Items added for %s in %.2fs", phone[:6] + "***", time.perf_counter() - t0)
-        return reply
-
-    menu_reply = await _try_serve_catalog_menu(session, user_message, restaurants)
-    if menu_reply:
-        session.history = [
-            {"role": "user", "parts": [user_message]},
-            {"role": "model", "parts": [menu_reply]},
-        ] + session.history[-14:]
-        await save_session_async(session)
-        logger.info("Catalog menu for %s slug=%s in %.2fs", phone[:6] + "***", session.active_tenant_slug, time.perf_counter() - t0)
-        return menu_reply
-
-    # Customer done adding items — show summary if we have everything
-    last_bot = _last_model_text(session)
-    done_adding = is_done_adding_items(user_message) or (
-        session.pending_items and is_declining_more_items(user_message, last_bot)
-    )
-    if done_adding and session.pending_items:
-        if pending_order_complete(session):
-            customer_reply = format_order_summary(session, catalog_items, session.language)
-            session.state = "confirming"
-            session.awaiting_confirm = True
-            session.history = [
-                {"role": "user", "parts": [user_message]},
-                {"role": "model", "parts": [customer_reply]},
-            ] + session.history[-16:]
-            await save_session_async(session)
-            logger.info("Order summary (done adding) for %s", phone[:6] + "***")
-            return customer_reply
-        missing = []
-        if not session.pending_customer_name:
-            missing.append("name")
-        if not session.pending_address:
-            missing.append("address")
-        if missing:
-            if "name" in missing:
-                reply = msg("ask_name", session.language)
-            else:
-                reply = msg("ask_address", session.language)
-            session.history = [
-                {"role": "user", "parts": [user_message]},
-                {"role": "model", "parts": [reply]},
-            ] + session.history[-16:]
-            await save_session_async(session)
-            return reply
-
-    active_name = None
-    if session.active_tenant_slug:
-        active_name = next(
-            (r["name"] for r in restaurants if r["slug"] == session.active_tenant_slug),
-            session.active_tenant_slug,
-        )
-
-    collecting_details = (
-        bool(session.active_tenant_slug)
-        and session.state == "ordering"
-        and is_mid_order_detail_reply(user_message)
-        and not is_menu_request(user_message)
-    )
+    menu_block, catalog, active_name, categories = await _build_menu_block(session, restaurants)
 
     now = datetime.now(timezone.utc)
     last_order_summary = None
-    if session.confirmed_orders:
-        last_order = session.confirmed_orders[-1] or {}
+    if getattr(session, "confirmed_orders", None):
+        last = session.confirmed_orders[-1] or {}
         last_order_summary = {
-            "restaurant": last_order.get("restaurant"),
-            "items": last_order.get("items") or [],
+            "restaurant": last.get("restaurant"),
+            "items": last.get("items") or [],
         }
-    prompt_menu_block = menu_block
-    if session.active_tenant_slug and catalog_items:
-        prompt_menu_block = f"{active_name or session.active_tenant_slug} ({session.active_tenant_slug}):\n{format_grouped_menu(catalog_items)}"
-
-    if edit_summary:
-        edit_note = (
-            f"\nThe customer just edited their cart via a short message: {edit_summary}. "
-            "Acknowledge the edit naturally, show the updated cart if it changed, "
-            "and ask if there's anything else.\n"
-        )
-    else:
-        edit_note = ""
 
     system = build_system_prompt(
         restaurants=restaurants,
-        menu_block=prompt_menu_block,
+        menu_block=menu_block,
         active_restaurant=active_name,
         active_slug=session.active_tenant_slug,
-        state=session.state,
-        language=session.language,
-        collecting_details=collecting_details,
+        state=session.state or ("ordering" if session.active_tenant_slug else "greeting"),
+        language=lang,
         pending_name=session.pending_customer_name,
         pending_address=session.pending_address,
         pending_items=session.pending_items,
         now=now,
         last_order_summary=last_order_summary,
-        categories=unique_categories(catalog_items) if catalog_items else None,
-    ) + edit_note
+        categories=categories,
+    )
 
-    history = []
-    for h in session.history:
-        role = "user" if h.get("role") == "user" else "model"
-        parts = h.get("parts", [])
-        text = parts[0] if parts else ""
-        # Strip any leaked ORDER_JSON from history shown to model
-        text = ORDER_JSON_PATTERN.sub("", text).strip()
-        if text:
-            history.append({"role": role, "parts": [text]})
-
-    persist_fail_message = msg("persist_fail", session.language)
+    history = _build_history_for_llm(session)
 
     try:
-        order = None
-        customer_reply = ""
-
-        if is_yes and (session.state == "confirming" or awaiting_confirm):
-            if session.state != "confirming":
-                session.state = "confirming"
-            logger.info("Confirm yes detected for %s (awaiting=%s)", phone[:6] + "***", awaiting_confirm)
-            order = order_from_session(session)
-            if order:
-                missing = _missing_order_details(order, session)
-                if missing:
-                    customer_reply = _ask_for_missing_detail(missing, session.language)
-                    session.awaiting_confirm = True
-                else:
-                    order["phone"] = phone
-                    customer_reply = await _finalize_order(
-                        phone, order, session, persist_fail_message=persist_fail_message
-                    )
-                    session.awaiting_confirm = False
-            else:
-                _, order = await _extract_order_on_confirm(
-                    phone, user_message, session, restaurants, history, menu_block
-                )
-                if order:
-                    missing = _missing_order_details(order, session)
-                    if missing:
-                        customer_reply = _ask_for_missing_detail(missing, session.language)
-                        session.awaiting_confirm = True
-                    else:
-                        customer_reply = await _finalize_order(
-                            phone, order, session, persist_fail_message=persist_fail_message
-                        )
-                        session.awaiting_confirm = False
-                else:
-                    customer_reply = msg("confirm_fail", session.language)
-                    session.awaiting_confirm = True
-        else:
-            menu_reply = await _try_serve_catalog_menu(session, user_message, restaurants)
-            if menu_reply:
-                customer_reply = menu_reply
-                order = None
-            else:
-                raw_text = await generate_reply(system, history, user_message)
-                if not raw_text:
-                    return _smart_fallback_reply(session, restaurants, catalog_items)
-
-                customer_reply, order = _strip_order_json(raw_text)
-
-                if order:
-                    order["phone"] = phone
-                    if not order.get("restaurant") and session.active_tenant_slug:
-                        order["restaurant"] = session.active_tenant_slug
-                    missing = _missing_order_details(order, session)
-                    if missing:
-                        customer_reply = _ask_for_missing_detail(missing, session.language)
-                        session.state = "ordering"
-                        session.awaiting_confirm = False
-                    else:
-                        customer_reply = await _finalize_order(
-                            phone, order, session, persist_fail_message=persist_fail_message
-                        )
-                elif (
-                    pending_order_complete(session)
-                    and (
-                        _looks_like_confirm_prompt(customer_reply)
-                        or _order_summary_in_reply(customer_reply)
-                    )
-                ):
-                    session.state = "confirming"
-                    session.awaiting_confirm = True
-
-        session.history = [
-            {"role": "user", "parts": [user_message]},
-            {"role": "model", "parts": [customer_reply[:2000]]},
-        ] + session.history[-16:]
-
-        if order or session.state == "done":
-            session.awaiting_confirm = False
-        elif (
-            pending_order_complete(session)
-            and (
-                _looks_like_confirm_prompt(customer_reply)
-                or _order_summary_in_reply(customer_reply)
-            )
-        ):
-            session.state = "confirming"
-            session.awaiting_confirm = True
-        elif session.active_tenant_slug:
-            session.state = "ordering"
-
-        await save_session_async(session)
-        logger.info(
-            "%s reply for %s state=%s in %.2fs",
-            provider_label(),
-            phone[:6] + "***",
-            session.state,
-            time.perf_counter() - t0,
-        )
-        return customer_reply or msg("rate_limit", session.language)
+        raw_text = await generate_reply(system, history, user_message)
     except LlmRateLimitError:
-        logger.warning("LLM rate limited for %s — using smart fallback", phone[:6] + "***")
-        return _smart_fallback_reply(session, restaurants, catalog_items)
+        logger.warning("LLM rate limited for %s — smart fallback", phone[:6] + "***")
+        reply = await _smart_fallback_reply(session, restaurants, catalog)
+        await _save_and_log(session, phone, user_message, reply, t0, source="fallback")
+        return reply
     except Exception as exc:
         err = str(exc)
         if "429" in err or "ResourceExhausted" in err or "quota" in err.lower():
-            logger.warning("LLM quota exceeded for %s — using smart fallback", phone[:6] + "***")
-            return _smart_fallback_reply(session, restaurants, catalog_items)
-        logger.exception("Order agent failed after %.2fs", time.perf_counter() - t0)
-        return msg("rate_limit", session.language)
+            logger.warning("LLM quota for %s — smart fallback", phone[:6] + "***")
+            reply = await _smart_fallback_reply(session, restaurants, catalog)
+            await _save_and_log(session, phone, user_message, reply, t0, source="fallback")
+            return reply
+        logger.exception("LLM call failed after %.2fs", time.perf_counter() - t0)
+        reply = msg("rate_limit", lang)
+        await _save_and_log(session, phone, user_message, reply, t0, source="error")
+        return reply
+
+    if not raw_text or not raw_text.strip():
+        reply = await _smart_fallback_reply(session, restaurants, catalog)
+        await _save_and_log(session, phone, user_message, reply, t0, source="empty")
+        return reply
+
+    obj = _extract_json_object(raw_text)
+
+    if obj is None:
+        # The LLM ignored the JSON contract and replied in prose.
+        # Show its text to the customer but keep cart unchanged.
+        customer_reply = _strip_order_json_text(raw_text).strip() or msg("menu_ask", lang)
+        if session.active_tenant_slug:
+            session.state = "ordering"
+        await _save_and_log(session, phone, user_message, customer_reply, t0, source="llm-text")
+        return customer_reply
+
+    reply_text = (obj.get("reply") or "").strip() or msg("menu_ask", lang)
+
+    new_slug = (obj.get("restaurant") or "").strip().lower()
+    new_name = (obj.get("customer_name") or "").strip()
+    new_address = (obj.get("address") or "").strip()
+    new_items = _validate_cart_items(obj.get("items"), catalog)
+    place = bool(obj.get("place_order"))
+
+    # Apply cart changes
+    if new_slug and new_slug != session.active_tenant_slug:
+        from app.core.tenant_ids import TENANT_IDS
+        session.active_tenant_slug = new_slug
+        session.active_tenant_id = str(TENANT_IDS.get(new_slug, ""))
+        session.pending_items = []
+        session.state = "ordering"
+    if new_name:
+        session.pending_customer_name = new_name
+    if new_address:
+        session.pending_address = new_address
+    if new_items:
+        # Merge if the restaurant didn't change; otherwise replace
+        existing = {(i.get("item") or "").lower(): i for i in session.pending_items}
+        for it in new_items:
+            key = it["item"].lower()
+            if key in existing and session.active_tenant_slug == session.active_tenant_slug:
+                # Last-write-wins per turn: replace existing entry's qty/notes
+                existing[key] = it
+            else:
+                existing[key] = it
+        session.pending_items = list(existing.values())
+    elif obj.get("items") == [] and session.pending_items and not place:
+        # LLM explicitly cleared the cart
+        session.pending_items = []
+
+    # Determine whether to show menu (first time the restaurant is chosen)
+    if new_slug and new_slug != session.active_tenant_slug:
+        # Just changed — state already set above
+        pass
+
+    # If the LLM signaled place_order, persist
+    placed = False
+    if place:
+        order_obj = {
+            "restaurant": new_slug or session.active_tenant_slug,
+            "customer_name": new_name or session.pending_customer_name or "",
+            "address": new_address or session.pending_address or "",
+            "items": new_items or session.pending_items,
+            "special_requests": (obj.get("special_requests") or "").strip(),
+        }
+        if order_obj["customer_name"] and order_obj["address"] and order_obj["items"]:
+            result = await _finalize_order_from_json(phone, order_obj, session)
+            if result:
+                placed = True
+                reply_text = msg(
+                    "order_confirmed",
+                    lang,
+                    total=float(result["total"]),
+                    order_id=str(result["order_id"])[:8].upper(),
+                )
+                session.awaiting_confirm = False
+                # Defense-in-depth even if _finalize_order_from_json is mocked
+                session.pending_items = []
+                session.pending_customer_name = None
+                session.pending_address = None
+                session.state = "done"
+            else:
+                reply_text = msg("persist_fail", lang)
+                session.state = "ordering"
+        else:
+            # Not enough info to place — ask for the missing piece
+            missing = []
+            if not order_obj["customer_name"]:
+                missing.append("name")
+            if not order_obj["address"]:
+                missing.append("address")
+            if not order_obj["items"]:
+                missing.append("items")
+            if "name" in missing:
+                reply_text = msg("ask_name", lang)
+            elif "address" in missing:
+                reply_text = msg("ask_address", lang)
+            elif "items" in missing:
+                reply_text = msg("menu_ask", lang)
+            session.state = "ordering"
+            session.awaiting_confirm = False
+    else:
+        if session.active_tenant_slug:
+            session.state = "ordering"
+
+    # Light heuristics for state ONLY when placement did not already decide it
+    if not placed and not session.active_tenant_slug:
+        session.state = "greeting"
+    # Otherwise the place branch above already set state correctly.
+
+    await _save_and_log(session, phone, user_message, reply_text, t0, source="llm")
+    return reply_text
+
+
+def _strip_order_json_text(text: str) -> str:
+    """Remove any [ORDER_JSON] block from text, return the cleaned prose."""
+    return ORDER_JSON_PATTERN.sub("", text).strip()
+
+
+def _build_history_for_llm(session) -> list[dict]:
+    history: list[dict] = []
+    for h in session.history or []:
+        role = "user" if h.get("role") == "user" else "model"
+        parts = h.get("parts") or []
+        text = parts[0] if parts else ""
+        text = ORDER_JSON_PATTERN.sub("", text).strip()
+        if text:
+            history.append({"role": role, "parts": [text]})
+    return history[-16:]
+
+
+async def _gather_session_and_restaurants(phone: str):
+    return await asyncio.gather(get_session_async(phone), list_active_restaurants())
+
+
+async def _save_and_log(session, phone, user_message, reply_text, t0, *, source):
+    session.history = [
+        {"role": "user", "parts": [user_message]},
+        {"role": "model", "parts": [reply_text[:2000]]},
+    ] + (session.history or [])[-16:]
+    session.updated_at = datetime.now(timezone.utc)
+    await save_session_async(session)
+    logger.info(
+        "%s reply for %s state=%s in %.2fs",
+        source,
+        phone[:6] + "***",
+        getattr(session, "state", "?"),
+        time.perf_counter() - t0,
+    )
+
+
+async def _light_routing(session, user_message: str, restaurants: list[dict], normalized: str) -> None:
+    """Apply a few cheap, high-recall routing rules BEFORE the LLM is called.
+
+    Pure additions to avoid a wasted LLM round trip on the clearest cases:
+    - reset / new order
+    - restaurant name in text → set active slug (so the menu block is right)
+    - language stickiness
+    """
+    if normalized in RESET_WORDS:
+        session.active_tenant_slug = None
+        session.active_tenant_id = None
+        session.state = "greeting"
+        session.awaiting_confirm = False
+        session.pending_customer_name = None
+        session.pending_address = None
+        session.pending_items = []
+        session.history = []
+        return
+    if not session.active_tenant_slug:
+        slug = _resolve_slug_light(user_message, restaurants)
+        if slug:
+            from app.core.tenant_ids import TENANT_IDS
+            session.active_tenant_slug = slug
+            session.active_tenant_id = str(TENANT_IDS.get(slug, ""))
+            session.state = "ordering"
+    # Keep language sticky across short replies in the same chat
+    detected = detect_language(user_message)
+    if detected == "roman_ur":
+        session.language = "roman_ur"
+    elif not session.history and detected:
+        session.language = detected
+
+
+def _resolve_slug_light(text: str, restaurants: list[dict]) -> str | None:
+    """Cheap restaurant detection — full slug-match wins."""
+    if not restaurants or not text:
+        return None
+    lower = text.lower()
+    for r in sorted(restaurants, key=lambda x: len(x["slug"]), reverse=True):
+        slug = r["slug"]
+        name = (r.get("name") or "").lower()
+        if slug in lower or (name and name in lower):
+            return slug
+    if "kababjees" in lower or "kababjee" in lower or re.search(r"kabab\s*jee?s?", lower):
+        return "kababjees"
+    if "kfc" in lower or "kentucky" in lower:
+        return "kfc"
+    return None
 
 
 def process_order_message(phone: str, user_message: str) -> str:
     try:
         asyncio.get_running_loop()
         import concurrent.futures
-
         with concurrent.futures.ThreadPoolExecutor() as pool:
             return pool.submit(asyncio.run, process_order_message_async(phone, user_message)).result(
                 timeout=60
