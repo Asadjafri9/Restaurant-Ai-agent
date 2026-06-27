@@ -150,3 +150,115 @@ def test_has_remove_cue_english():
 def test_has_remove_cue_thank_you_false():
     assert not has_remove_cue("thanks bhai")
     assert not has_remove_cue("shukriya")
+
+
+def test_is_show_order_request_english():
+    from app.services.order_agent import _is_show_order_request
+
+    assert _is_show_order_request("show my order")
+    assert _is_show_order_request("Show my order in better format please")
+    assert _is_show_order_request("order summary please")
+    assert _is_show_order_request("what did I order")
+    assert _is_show_order_request("check my order")
+
+
+def test_is_show_order_request_urdu():
+    from app.services.order_agent import _is_show_order_request
+
+    assert _is_show_order_request("mera order batao")
+    assert _is_show_order_request("order dikha do")
+    assert _is_show_order_request("mere order ka kya hai")
+
+
+def test_is_show_order_request_negative():
+    from app.services.order_agent import _is_show_order_request
+
+    assert not _is_show_order_request("1 zinger chahiye")
+    assert not _is_show_order_request("biryani hatao")
+    assert not _is_show_order_request("yes")
+    assert not _is_show_order_request("kfc")
+
+
+def test_missing_order_details_both_missing():
+    from app.services.order_agent import _missing_order_details
+
+    s = CustomerSession(phone="+923001234567", pending_items=[{"item": "Krusher", "quantity": 1}])
+    order = {"items": [{"item": "Krusher", "quantity": 1}]}
+    assert _missing_order_details(order, s) == ["name", "address"]
+
+
+def test_missing_order_details_name_only():
+    from app.services.order_agent import _missing_order_details
+
+    s = CustomerSession(
+        phone="+923001234567",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+        pending_address="Block C5",
+    )
+    order = {"items": [{"item": "Krusher", "quantity": 1}], "address": "Block C5"}
+    assert _missing_order_details(order, s) == ["name"]
+
+
+def test_missing_order_details_address_only():
+    from app.services.order_agent import _missing_order_details
+
+    s = CustomerSession(
+        phone="+923001234567",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+        pending_customer_name="Ali",
+    )
+    order = {"items": [{"item": "Krusher", "quantity": 1}], "customer_name": "Ali"}
+    assert _missing_order_details(order, s) == ["address"]
+
+
+def test_missing_order_details_none_missing():
+    from app.services.order_agent import _missing_order_details
+
+    s = CustomerSession(
+        phone="+923001234567",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+        pending_customer_name="Ali",
+        pending_address="Block C5",
+    )
+    order = {
+        "items": [{"item": "Krusher", "quantity": 1}],
+        "customer_name": "Ali",
+        "address": "Block C5",
+    }
+    assert _missing_order_details(order, s) == []
+
+
+def test_missing_order_details_session_overrides_empty_order():
+    """If the LLM-emitted order has empty fields but session has them, do not re-ask."""
+    from app.services.order_agent import _missing_order_details
+
+    s = CustomerSession(
+        phone="+923001234567",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+        pending_customer_name="Ali",
+        pending_address="Block C5",
+    )
+    order = {"items": [{"item": "Krusher", "quantity": 1}], "customer_name": "", "address": ""}
+    assert _missing_order_details(order, s) == []
+
+
+def test_ask_for_missing_detail_name_only():
+    from app.services.order_agent import _ask_for_missing_detail
+
+    reply = _ask_for_missing_detail(["name"], "en")
+    assert "name" in reply.lower()
+
+
+def test_ask_for_missing_detail_address_only():
+    from app.services.order_agent import _ask_for_missing_detail
+
+    reply = _ask_for_missing_detail(["address"], "en")
+    assert "address" in reply.lower()
+
+
+def test_ask_for_missing_detail_both_urdu():
+    from app.services.order_agent import _ask_for_missing_detail
+
+    reply = _ask_for_missing_detail(["name", "address"], "roman_ur")
+    assert "naam" in reply.lower() or "name" in reply.lower()
+    assert "address" in reply.lower()

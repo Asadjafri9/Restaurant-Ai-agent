@@ -150,6 +150,19 @@ ORDER_DONE_MARKERS = (
     "45-60",
 )
 
+SHOW_ORDER_CUES = (
+    "show my order", "show order", "show the order", "order summary",
+    "summary of my order", "summarize my order", "summarize the order",
+    "summary please", "mera order", "order dikha", "order bata", "order batao",
+    "better format", "in better format", "in a better format", "nicer format",
+    "my order please", "order list", "list my order", "what did i order",
+    "what's in my order", "what have i ordered", "order review", "check my order",
+    "show cart", "my cart", "show items", "kya order kiya",
+    "kya hai mere order", "order detail", "order details",
+    "tell me my order", "show me my order", "mera order batao",
+    "order ka summary", "order ka kya hai",
+)
+
 
 def _update_session_language(session, user_message: str) -> None:
     """Keep Roman Urdu across short/ambiguous voice replies in the same chat."""
@@ -576,6 +589,32 @@ async def _persist_order(phone: str, order: dict, session) -> dict | None:
     return result
 
 
+def _is_show_order_request(text: str) -> bool:
+    """True when the customer wants to see their order / cart, not add or edit it."""
+    if not text:
+        return False
+    lower = text.lower()
+    return any(cue in lower for cue in SHOW_ORDER_CUES)
+
+
+def _missing_order_details(order: dict, session) -> list[str]:
+    """Return ['name'] / ['address'] / ['name','address'] for what is still missing."""
+    missing: list[str] = []
+    if not (order.get("customer_name") or session.pending_customer_name):
+        missing.append("name")
+    if not (order.get("address") or session.pending_address):
+        missing.append("address")
+    return missing
+
+
+def _ask_for_missing_detail(missing: list[str], lang: str) -> str:
+    if "name" in missing and "address" in missing:
+        return msg("ask_name", lang) + "\n" + msg("ask_address", lang)
+    if "name" in missing:
+        return msg("ask_name", lang)
+    return msg("ask_address", lang)
+
+
 def _fast_greeting(restaurants: list[dict], lang: str) -> str:
     if not restaurants:
         return msg("no_restaurants", lang)
@@ -799,6 +838,24 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
             _, catalog_items = await get_menu_by_slug(session.active_tenant_slug, force_refresh=True)
         order = order_from_session(session)
         if order:
+            missing = _missing_order_details(order, session)
+            if missing:
+                customer_reply = _ask_for_missing_detail(missing, session.language)
+                session.awaiting_confirm = True
+                if session.state == "done":
+                    session.state = "ordering"
+                session.history = [
+                    {"role": "user", "parts": [user_message]},
+                    {"role": "model", "parts": [customer_reply[:2000]]},
+                ] + session.history[-16:]
+                await save_session_async(session)
+                logger.info(
+                    "Early confirm blocked: missing %s for %s in %.2fs",
+                    missing,
+                    phone[:6] + "***",
+                    time.perf_counter() - t0,
+                )
+                return customer_reply
             order["phone"] = phone
             persist_fail_message = msg("persist_fail", session.language)
             customer_reply = await _finalize_order(
@@ -860,6 +917,39 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
             has_modifier_with_item = True
 
     skip_items_added_reply = edit_applied or has_modifier_with_item
+
+    if _is_show_order_request(user_message) and session.active_tenant_slug and not is_yes:
+        if not catalog_items:
+            _, catalog_items = await get_menu_by_slug(
+                session.active_tenant_slug, force_refresh=True
+            )
+        if session.pending_items:
+            if pending_order_complete(session):
+                customer_reply = format_order_summary(
+                    session, catalog_items, session.language
+                )
+                session.state = "confirming"
+                session.awaiting_confirm = True
+            else:
+                items_text = format_pending_items_list(session.pending_items)
+                missing = _missing_order_details({}, session)
+                ask = _ask_for_missing_detail(missing, session.language)
+                customer_reply = (
+                    f"Here's your order so far:\n{items_text}\n\n{ask}"
+                )
+                session.state = "ordering"
+                session.awaiting_confirm = False
+        else:
+            customer_reply = msg("menu_ask", session.language)
+            session.state = "ordering"
+            session.awaiting_confirm = False
+        session.history = [
+            {"role": "user", "parts": [user_message]},
+            {"role": "model", "parts": [customer_reply]},
+        ] + session.history[-16:]
+        await save_session_async(session)
+        logger.info("Show-order shortcut for %s in %.2fs", phone[:6] + "***", time.perf_counter() - t0)
+        return customer_reply
 
     if (
         session.active_tenant_slug
@@ -1008,20 +1098,30 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
             logger.info("Confirm yes detected for %s (awaiting=%s)", phone[:6] + "***", awaiting_confirm)
             order = order_from_session(session)
             if order:
-                order["phone"] = phone
-                customer_reply = await _finalize_order(
-                    phone, order, session, persist_fail_message=persist_fail_message
-                )
-                session.awaiting_confirm = False
+                missing = _missing_order_details(order, session)
+                if missing:
+                    customer_reply = _ask_for_missing_detail(missing, session.language)
+                    session.awaiting_confirm = True
+                else:
+                    order["phone"] = phone
+                    customer_reply = await _finalize_order(
+                        phone, order, session, persist_fail_message=persist_fail_message
+                    )
+                    session.awaiting_confirm = False
             else:
                 _, order = await _extract_order_on_confirm(
                     phone, user_message, session, restaurants, history, menu_block
                 )
                 if order:
-                    customer_reply = await _finalize_order(
-                        phone, order, session, persist_fail_message=persist_fail_message
-                    )
-                    session.awaiting_confirm = False
+                    missing = _missing_order_details(order, session)
+                    if missing:
+                        customer_reply = _ask_for_missing_detail(missing, session.language)
+                        session.awaiting_confirm = True
+                    else:
+                        customer_reply = await _finalize_order(
+                            phone, order, session, persist_fail_message=persist_fail_message
+                        )
+                        session.awaiting_confirm = False
                 else:
                     customer_reply = msg("confirm_fail", session.language)
                     session.awaiting_confirm = True
@@ -1041,10 +1141,22 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
                     order["phone"] = phone
                     if not order.get("restaurant") and session.active_tenant_slug:
                         order["restaurant"] = session.active_tenant_slug
-                    customer_reply = await _finalize_order(
-                        phone, order, session, persist_fail_message=persist_fail_message
+                    missing = _missing_order_details(order, session)
+                    if missing:
+                        customer_reply = _ask_for_missing_detail(missing, session.language)
+                        session.state = "ordering"
+                        session.awaiting_confirm = False
+                    else:
+                        customer_reply = await _finalize_order(
+                            phone, order, session, persist_fail_message=persist_fail_message
+                        )
+                elif (
+                    pending_order_complete(session)
+                    and (
+                        _looks_like_confirm_prompt(customer_reply)
+                        or _order_summary_in_reply(customer_reply)
                     )
-                elif _looks_like_confirm_prompt(customer_reply) or _order_summary_in_reply(customer_reply):
+                ):
                     session.state = "confirming"
                     session.awaiting_confirm = True
 
@@ -1055,7 +1167,13 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
 
         if order or session.state == "done":
             session.awaiting_confirm = False
-        elif _looks_like_confirm_prompt(customer_reply) or _order_summary_in_reply(customer_reply):
+        elif (
+            pending_order_complete(session)
+            and (
+                _looks_like_confirm_prompt(customer_reply)
+                or _order_summary_in_reply(customer_reply)
+            )
+        ):
             session.state = "confirming"
             session.awaiting_confirm = True
         elif session.active_tenant_slug:
