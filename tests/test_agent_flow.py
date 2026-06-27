@@ -416,3 +416,260 @@ async def test_llm_prose_fallback_shown_to_customer():
     ):
         reply = await process_order_message_async("+923001234567", "hi")
     assert "could you repeat" in reply.lower()
+
+@pytest.mark.asyncio
+async def test_first_pick_shows_deterministic_menu_with_exact_names():
+    """Bug: LLM said 'Chicken Burger' / 'Krushers' / no prices on the first KFC pick."""
+    session = CustomerSession(phone="+923001234567", state="greeting")
+    session.confirmed_orders = []
+
+    async def fake_session(phone):
+        return session
+
+    async def fake_list():
+        return [{"slug": "kfc", "name": "KFC"}]
+
+    async def fake_menu(slug, *, force_refresh=False):
+        return "tid-kfc", KFC_CATALOG
+
+    async def fake_llm(system, history, user_message):
+        raise AssertionError("LLM should NOT have been called on the first restaurant pick")
+
+    with (
+        patch("app.services.order_agent.get_session_async", AsyncMock(side_effect=fake_session)),
+        patch("app.services.order_agent.list_active_restaurants", AsyncMock(side_effect=fake_list)),
+        patch("app.services.order_agent.get_menu_by_slug", AsyncMock(side_effect=fake_menu)),
+        patch("app.services.order_agent.generate_reply", AsyncMock(side_effect=fake_llm)),
+        patch("app.services.order_agent.save_session_async", AsyncMock()),
+    ):
+        reply = await process_order_message_async("+923001234567", "Kfc")
+    assert "Zinger Burger" in reply, f"expected exact menu name; got: {reply!r}"
+    assert "Krusher" in reply, f"expected exact menu name; got: {reply!r}"
+    assert "Chicken Burger" not in reply, "must not paraphrase to 'Chicken Burger'"
+    assert "Krushers" not in reply, "must not pluralize to 'Krushers'"
+    assert "Rs 520" in reply, "must show price for Zinger Burger"
+    assert "Rs 380" in reply, "must show price for Krusher"
+    assert session.active_tenant_slug == "kfc"
+
+
+@pytest.mark.asyncio
+async def test_done_adding_no_preserves_cart_and_asks_for_name():
+    """Bug: customer said 'No' to 'anything else?'; LLM cleared the cart."""
+    session = CustomerSession(
+        phone="+923001234567",
+        state="ordering",
+        active_tenant_slug="kfc",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+        history=[
+            {"role": "model", "parts": ["Got it — 1 Krusher. Anything else?"]},
+        ],
+    )
+
+    async def fake_session(phone):
+        return session
+
+    async def fake_llm(system, history, user_message):
+        raise AssertionError("LLM should NOT be called for 'No' after 'anything else?'")
+
+    with (
+        patch("app.services.order_agent.get_session_async", AsyncMock(side_effect=fake_session)),
+        patch(
+            "app.services.order_agent.list_active_restaurants",
+            AsyncMock(return_value=[{"slug": "kfc", "name": "KFC"}]),
+        ),
+        patch(
+            "app.services.order_agent.get_menu_by_slug",
+            AsyncMock(return_value=("tid-kfc", KFC_CATALOG)),
+        ),
+        patch("app.services.order_agent.generate_reply", AsyncMock(side_effect=fake_llm)),
+        patch("app.services.order_agent.save_session_async", AsyncMock()),
+    ):
+        reply = await process_order_message_async("+923001234567", "no")
+    assert len(session.pending_items) == 1
+    assert session.pending_items[0]["item"] == "Krusher"
+    assert "name" in reply.lower() or "naam" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_done_adding_ok_preserves_cart_and_asks_for_address():
+    """Bug: customer said 'Ok' to 'kuch aur?'; LLM cleared the cart."""
+    session = CustomerSession(
+        phone="+923001234567",
+        state="ordering",
+        active_tenant_slug="kfc",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+        pending_customer_name="Asad",
+        history=[
+            {"role": "model", "parts": ["Got it — 1 Krusher. Kuch aur?"]},
+        ],
+    )
+
+    async def fake_session(phone):
+        return session
+
+    async def fake_llm(system, history, user_message):
+        raise AssertionError("LLM should NOT be called for 'Ok' after 'kuch aur?'")
+
+    with (
+        patch("app.services.order_agent.get_session_async", AsyncMock(side_effect=fake_session)),
+        patch(
+            "app.services.order_agent.list_active_restaurants",
+            AsyncMock(return_value=[{"slug": "kfc", "name": "KFC"}]),
+        ),
+        patch(
+            "app.services.order_agent.get_menu_by_slug",
+            AsyncMock(return_value=("tid-kfc", KFC_CATALOG)),
+        ),
+        patch("app.services.order_agent.generate_reply", AsyncMock(side_effect=fake_llm)),
+        patch("app.services.order_agent.save_session_async", AsyncMock()),
+    ):
+        reply = await process_order_message_async("+923001234567", "Ok")
+    assert len(session.pending_items) == 1
+    assert session.pending_items[0]["item"] == "Krusher"
+    assert "address" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_done_adding_with_name_and_address_shows_summary():
+    """Bug: bot said 'which restaurant' instead of summary when name+address present."""
+    session = CustomerSession(
+        phone="+923001234567",
+        state="ordering",
+        active_tenant_slug="kfc",
+        pending_customer_name="Asad",
+        pending_address="Block C5",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+        history=[
+            {"role": "model", "parts": ["Got it — 1 Krusher. Anything else?"]},
+        ],
+    )
+
+    async def fake_session(phone):
+        return session
+
+    async def fake_llm(system, history, user_message):
+        raise AssertionError("LLM should NOT be called here")
+
+    with (
+        patch("app.services.order_agent.get_session_async", AsyncMock(side_effect=fake_session)),
+        patch(
+            "app.services.order_agent.list_active_restaurants",
+            AsyncMock(return_value=[{"slug": "kfc", "name": "KFC"}]),
+        ),
+        patch(
+            "app.services.order_agent.get_menu_by_slug",
+            AsyncMock(return_value=("tid-kfc", KFC_CATALOG)),
+        ),
+        patch("app.services.order_agent.generate_reply", AsyncMock(side_effect=fake_llm)),
+        patch("app.services.order_agent.save_session_async", AsyncMock()),
+    ):
+        reply = await process_order_message_async("+923001234567", "no")
+    assert "Asad" in reply
+    assert "Block C5" in reply
+    assert "Rs 380" in reply
+    assert "YES" in reply or "han kardo" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_no_short_ack_outside_anything_else_still_calls_llm():
+    """When the bot's last message is NOT 'anything else?', short acks go to the LLM."""
+    session = CustomerSession(
+        phone="+923001234567",
+        state="ordering",
+        active_tenant_slug="kfc",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+        history=[
+            {"role": "model", "parts": ["Which restaurant would you like to order from?"]},
+        ],
+    )
+
+    async def fake_session(phone):
+        return session
+
+    llm_called = {"n": 0}
+
+    async def fake_llm(system, history, user_message):
+        llm_called["n"] += 1
+        return json.dumps(
+            {
+                "reply": "Got it. What can I get for you?",
+                "items": [{"item": "Krusher", "quantity": 1}],
+                "place_order": False,
+            }
+        )
+
+    with (
+        patch("app.services.order_agent.get_session_async", AsyncMock(side_effect=fake_session)),
+        patch(
+            "app.services.order_agent.list_active_restaurants",
+            AsyncMock(return_value=[{"slug": "kfc", "name": "KFC"}]),
+        ),
+        patch(
+            "app.services.order_agent.get_menu_by_slug",
+            AsyncMock(return_value=("tid-kfc", KFC_CATALOG)),
+        ),
+        patch("app.services.order_agent.generate_reply", AsyncMock(side_effect=fake_llm)),
+        patch("app.services.order_agent.save_session_async", AsyncMock()),
+    ):
+        await process_order_message_async("+923001234567", "ok")
+    assert llm_called["n"] == 1
+
+
+def test_done_asking_markers_includes_english_and_urdu():
+    from app.services.order_agent import _DONE_ASKING_MARKERS
+
+    assert "anything else" in _DONE_ASKING_MARKERS
+    assert "kuch aur" in _DONE_ASKING_MARKERS
+
+
+def test_ack_words_contains_short_acks():
+    from app.services.order_agent import _ACK_WORDS
+
+    for w in ("no", "ok", "theek", "sahi", "han", "haan", "done", "bas"):
+        assert w in _ACK_WORDS, f"missing {w!r}"
+
+
+@pytest.mark.asyncio
+async def test_llm_clearing_cart_without_reset_signal_is_blocked():
+    """The LLM must NOT be able to clear the cart on a short ack by emitting items=[]."""
+    session = CustomerSession(
+        phone="+923001234567",
+        state="ordering",
+        active_tenant_slug="kfc",
+        pending_items=[{"item": "Krusher", "quantity": 1}],
+        history=[
+            {"role": "user", "parts": ["kfc"]},
+            {"role": "model", "parts": ["Welcome to KFC."]},
+        ],
+    )
+
+    async def fake_session(phone):
+        return session
+
+    async def fake_llm(system, history, user_message):
+        return json.dumps(
+            {
+                "reply": "Which restaurant would you like to order from?",
+                "restaurant": "",
+                "items": [],
+                "place_order": False,
+            }
+        )
+
+    with (
+        patch("app.services.order_agent.get_session_async", AsyncMock(side_effect=fake_session)),
+        patch(
+            "app.services.order_agent.list_active_restaurants",
+            AsyncMock(return_value=[{"slug": "kfc", "name": "KFC"}]),
+        ),
+        patch(
+            "app.services.order_agent.get_menu_by_slug",
+            AsyncMock(return_value=("tid-kfc", KFC_CATALOG)),
+        ),
+        patch("app.services.order_agent.generate_reply", AsyncMock(side_effect=fake_llm)),
+        patch("app.services.order_agent.save_session_async", AsyncMock()),
+    ):
+        await process_order_message_async("+923001234567", "ok")
+    assert len(session.pending_items) == 1
+    assert session.pending_items[0]["item"] == "Krusher"
+    assert session.active_tenant_slug == "kfc"

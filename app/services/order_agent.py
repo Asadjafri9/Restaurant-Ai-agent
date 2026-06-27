@@ -235,10 +235,52 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
         session.language = detect_language(user_message) or "en"
     lang = session.language
 
+    # Remember whether the customer explicitly asked to reset/cancel/start over.
+    # Only this signal (not the LLM's judgement) can clear the cart.
+    customer_reset_signal = normalized in RESET_WORDS
+
     try:
         await _light_routing(session, user_message, restaurants, normalized)
     except Exception:
         logger.exception("light routing failed (non-fatal)")
+
+    # Fast-path 1: first-time restaurant pick (state was "greeting" before the
+    # customer's message, AND the customer just named a restaurant, AND the
+    # cart is empty). Show the deterministic menu — the LLM is too creative
+    # with paraphrased names and prices.
+    if (
+        session.active_tenant_slug
+        and not session.pending_items
+        and not session.confirmed_orders
+        and _resolve_slug_light(user_message, restaurants) == session.active_tenant_slug
+    ):
+        _, catalog_fast = await get_menu_by_slug(
+            session.active_tenant_slug, force_refresh=True
+        )
+        if catalog_fast:
+            fast_reply = _format_first_pick_menu_reply(
+                session.active_tenant_slug, restaurants, catalog_fast, lang
+            )
+            session.state = "ordering"
+            session.awaiting_confirm = False
+            await _save_and_log(session, phone, user_message, fast_reply, t0, source="first-pick")
+            return fast_reply
+
+    # Fast-path 2: bot just asked "anything else?" and customer said a short ack.
+    # The LLM keeps misreading "no" / "ok" / "theek" as "start over" and clearing
+    # the cart. Handle this deterministically to keep the cart.
+    if (
+        session.pending_items
+        and _is_short_ack_after_anything_else(user_message, session)
+    ):
+        fast_reply = await _format_done_adding_reply(session, lang)
+        session.state = "ordering"
+        session.awaiting_confirm = False
+        if fast_reply:
+            await _save_and_log(
+                session, phone, user_message, fast_reply, t0, source="done-adding"
+            )
+            return fast_reply
 
     menu_block, catalog, active_name, categories = await _build_menu_block(session, restaurants)
 
@@ -311,31 +353,46 @@ async def process_order_message_async(phone: str, user_message: str) -> str:
     new_items = _validate_cart_items(obj.get("items"), catalog)
     place = bool(obj.get("place_order"))
 
-    # Apply cart changes
-    if new_slug and new_slug != session.active_tenant_slug:
+    # Apply cart changes — only when the change makes sense.
+    # The LLM cannot clear the cart on a short ack; only an explicit reset or
+    # a real restaurant switch counts.
+    llm_switched_restaurant = bool(new_slug and new_slug != session.active_tenant_slug)
+    llm_cleared_cart = (
+        not new_items
+        and obj.get("items") == []
+        and session.pending_items
+        and not place
+    )
+    allow_clear = customer_reset_signal or llm_switched_restaurant
+
+    if llm_switched_restaurant:
         from app.core.tenant_ids import TENANT_IDS
         session.active_tenant_slug = new_slug
         session.active_tenant_id = str(TENANT_IDS.get(new_slug, ""))
         session.pending_items = []
         session.state = "ordering"
+    elif not new_slug and not session.active_tenant_slug:
+        # LLM left restaurant empty AND no restaurant is set yet — leave it.
+        pass
+    elif not new_slug and session.active_tenant_slug and not customer_reset_signal:
+        # LLM tried to clear the restaurant field without a switch or reset.
+        # Ignore — keep the existing active restaurant.
+        pass
+
     if new_name:
         session.pending_customer_name = new_name
     if new_address:
         session.pending_address = new_address
+
     if new_items:
-        # Merge if the restaurant didn't change; otherwise replace
+        # Merge: last-write-wins per turn on existing entries, add new ones.
         existing = {(i.get("item") or "").lower(): i for i in session.pending_items}
         for it in new_items:
-            key = it["item"].lower()
-            if key in existing and session.active_tenant_slug == session.active_tenant_slug:
-                # Last-write-wins per turn: replace existing entry's qty/notes
-                existing[key] = it
-            else:
-                existing[key] = it
+            existing[it["item"].lower()] = it
         session.pending_items = list(existing.values())
-    elif obj.get("items") == [] and session.pending_items and not place:
-        # LLM explicitly cleared the cart
+    elif llm_cleared_cart and allow_clear:
         session.pending_items = []
+    # else: LLM sent items:[] without a reset/switch signal → preserve cart.
 
     # Determine whether to show menu (first time the restaurant is chosen)
     if new_slug and new_slug != session.active_tenant_slug:
@@ -486,6 +543,117 @@ def _resolve_slug_light(text: str, restaurants: list[dict]) -> str | None:
     if "kfc" in lower or "kentucky" in lower:
         return "kfc"
     return None
+
+
+_DONE_ASKING_MARKERS = (
+    "anything else",
+    "kuch aur",
+    "kuch or",
+    "or order",
+    "aur kuch",
+    "aur chahiye",
+    "aur kuch chahiye",
+    "kuch aur add",
+    "aur add karna",
+    "aur kuch order",
+    "add karna hai",
+    "aur chahiye",
+    "kuch aur order",
+    "aur add karna chahte",
+    "aur kuch chahenge",
+    "aur kuch chahiye",
+)
+
+_ACK_WORDS = frozenset(
+    {
+        "no", "nahi", "na", "nope", "n", "bas", "bus",
+        "ok", "okay", "kk", "k", "y", "yes", "yep", "yeah", "yup",
+        "theek", "theek hai", "bilkul", "sahi", "agreed", "correct", "right",
+        "han", "haan", "hann", "ji", "jee", "haanji", "ji haan",
+        "done", "nothing", "none", "no more", "no thanks", "nahi bas",
+        "hmm", "hmm hmm", "hmmhmm", "achha", "acha", "ok ok", "okk",
+    }
+)
+
+
+def _last_assistant_text(session) -> str:
+    for h in session.history or []:
+        if h.get("role") == "model":
+            parts = h.get("parts") or []
+            if parts:
+                return str(parts[0])
+    return ""
+
+
+def _is_short_ack_after_anything_else(user_message: str, session) -> bool:
+    """True when the customer just said 'no' / 'ok' / 'theek' / etc. in
+    response to the bot's 'anything else?' prompt. The LLM keeps reading
+    these as 'start over' and clearing the cart, which is wrong."""
+    if not user_message or not session.history:
+        return False
+    last_bot = _last_assistant_text(session).lower()
+    if not any(marker in last_bot for marker in _DONE_ASKING_MARKERS):
+        return False
+    norm = _normalize_user_text(user_message)
+    if not norm:
+        return False
+    if norm in _ACK_WORDS:
+        return True
+    # Tolerate soft acks with one or two trailing words ("no thanks", "ok bas")
+    tokens = norm.split()
+    if tokens and tokens[0] in _ACK_WORDS and len(tokens) <= 3:
+        return True
+    return False
+
+
+def _format_first_pick_menu_reply(
+    slug: str, restaurants: list[dict], catalog: list[dict], lang: str
+) -> str:
+    """Deterministic full-menu reply when the customer first picks a restaurant.
+    Uses exact menu names and prices from the catalog — the LLM is too creative
+    with paraphrased names ('Chicken Burger' instead of 'Zinger Burger', etc.)."""
+    name = next((r["name"] for r in restaurants if r["slug"] == slug), slug)
+    if not catalog:
+        return msg("menu_empty", lang, name=name)
+    lines = [f"{name}'s full menu:"]
+    for i, item in enumerate(catalog, 1):
+        price = float(item.get("price", 0))
+        lines.append(f"  {i}. {item['name']} — Rs {price:.0f}")
+    if lang == "roman_ur":
+        lines.append("")
+        lines.append("Aap kya order karna chahte hain?")
+    else:
+        lines.append("")
+        lines.append("What would you like to order?")
+    return "\n".join(lines)
+
+
+async def _format_done_adding_reply(session, lang: str) -> str | None:
+    """Deterministic 'done adding items' reply: ask for next missing detail
+    (name, then address) or show summary. The cart is preserved."""
+    from app.services.order_context import format_pending_items_list, format_order_summary
+
+    if not session.pending_items:
+        return None
+    items_text = format_pending_items_list(session.pending_items)
+    if not session.pending_customer_name:
+        if items_text:
+            return f"Order so far:\n{items_text}\n\n{msg('ask_name', lang)}"
+        return msg("ask_name", lang)
+    if not session.pending_address:
+        if items_text:
+            return f"Order so far:\n{items_text}\n\n{msg('ask_address', lang)}"
+        return msg("ask_address", lang)
+    # Both present — show the summary and ask for confirmation
+    catalog_for_total = []
+    if session.active_tenant_slug:
+        try:
+            _, catalog_for_total = await get_menu_by_slug(
+                session.active_tenant_slug, force_refresh=True
+            )
+        except Exception:
+            logger.exception("fetching catalog for done-adding summary failed")
+    return format_order_summary(session, catalog_for_total, lang)
 
 
 def process_order_message(phone: str, user_message: str) -> str:
